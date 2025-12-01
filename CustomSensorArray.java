@@ -22,12 +22,11 @@ import edu.bu.pas.pokemon.linalg.Matrix;
 public class CustomSensorArray
     extends SensorArray
 {
-
-    // TODO: make fields if you want!
+    private static final Type[] ALL_TYPES = Type.values();
+    private static final Height[] ALL_HEIGHTS = Height.values();
 
     public CustomSensorArray()
     {
-        // TODO: intialize those fields if you make any!
     }
 
     public Matrix getSensorValues(final BattleView state, final MoveView action)
@@ -58,7 +57,14 @@ public class CustomSensorArray
 
 		final int mySpd = myActive.getCurrentStat(Stat.SPD);
 		final int oppSpd = oppActive.getCurrentStat(Stat.SPD);
+		final int myBaseSpd = myActive.getInitialStat(Stat.SPD);
+		final int oppBaseSpd = oppActive.getInitialStat(Stat.SPD);
+		
+		feats.add(safeRatio(mySpd, Math.max(1, myBaseSpd)));
+		feats.add(safeRatio(oppSpd, Math.max(1, oppBaseSpd)));
 		feats.add(mySpd > oppSpd ? 1.0 : 0.0);
+		final int maxSpd = Math.max(Math.max(mySpd, oppSpd), 1);
+		feats.add(safeRatio(mySpd - oppSpd, maxSpd));
 
 		final int mySize = myTeam.size();
 		final int oppSize = oppTeam.size();
@@ -75,6 +81,17 @@ public class CustomSensorArray
 		feats.add(normCounter(myTeam.getNumLightScreenTurnsRemaining(), 5));
 		feats.add(normCounter(oppTeam.getNumReflectTurnsRemaining(), 5));
 		feats.add(normCounter(oppTeam.getNumLightScreenTurnsRemaining(), 5));
+
+		MoveView oppLastMove = oppTeam.getLastMoveView();
+		if (oppLastMove != null) {
+			final int oppLastPriority = oppLastMove.getPriority();
+			final double oppPrNorm = oppLastPriority <= -1 ? 0.0 : 
+			                         (oppLastPriority >= 1 ? 1.0 : 
+			                          (oppLastPriority + 1.0) / 2.0);
+			feats.add(oppPrNorm);
+		} else {
+			feats.add(0.5);
+		}
 
 		if (action != null) {
 			final Type at = action.getType();
@@ -157,17 +174,15 @@ public class CustomSensorArray
     private static void writePokemonTypeOneHot(List<Double> dst, PokemonView p) {
         Type t1 = p.getCurrentType1();
         Type t2 = p.getCurrentType2();
-        Type[] all = Type.values();
-        for (Type t : all) {
+        for (Type t : ALL_TYPES) {
             boolean isThisType = (t == t1) || (t == t2);
             dst.add(isThisType ? 1.0 : 0.0);
         }
     }
 
     private static void writeMoveTypeOneHot(List<Double> dst, MoveView action) {
-        Type[] all = Type.values();
         Type mt = (action == null) ? null : action.getType();
-        for (Type t : all) {
+        for (Type t : ALL_TYPES) {
             dst.add(mt != null && mt == t ? 1.0 : 0.0);
         }
     }
@@ -183,7 +198,7 @@ public class CustomSensorArray
     
     private static void writeHeightOneHot(List<Double> dst, PokemonView p) {
         Height h = p.getHeight();
-        for (Height val : Height.values()) {
+        for (Height val : ALL_HEIGHTS) {
             dst.add(h == val ? 1.0 : 0.0);
         }
     }
@@ -214,8 +229,7 @@ public class CustomSensorArray
     }
 
     private void writeTeamTypeDistribution(List<Double> dst, TeamView team) {
-        Type[] allTypes = Type.values();
-        double[] counts = new double[allTypes.length];
+        double[] counts = new double[ALL_TYPES.length];
         for (int i = 0; i < team.size(); i++) {
             PokemonView p = team.getPokemonView(i);
             if (p == null) {
@@ -223,8 +237,8 @@ public class CustomSensorArray
             }
             Type t1 = p.getCurrentType1();
             Type t2 = p.getCurrentType2();
-            for (int tIdx = 0; tIdx < allTypes.length; tIdx++) {
-                Type candidate = allTypes[tIdx];
+            for (int tIdx = 0; tIdx < ALL_TYPES.length; tIdx++) {
+                Type candidate = ALL_TYPES[tIdx];
                 if (candidate == t1 || candidate == t2) {
                     counts[tIdx] += 1.0;
                 }
@@ -277,12 +291,14 @@ public class CustomSensorArray
 
 	private static void writeActionFeatures(final List<Double> dst, final MoveView action, final PokemonView caster, final PokemonView defender){
 		if (action == null){
-			// category(3), type(0 placeholder), power, acc, ppRatio, priority, critRatio, canHitHeight
+			// category(3), type(0 placeholder), power, acc, ppRatio, priority(4), critRatio, canHitHeight
 			dst.add(0.0); dst.add(0.0); dst.add(0.0);
 			dst.add(0.0);
 			dst.add(0.0);
 			dst.add(0.0);
 			dst.add(0.5);
+			dst.add(0.0);
+			dst.add(0.0);
 			dst.add(0.5);
 			dst.add(0.0);
 			return;
@@ -302,9 +318,16 @@ public class CustomSensorArray
 
 		final Integer pp = action.getPP();
 		dst.add(pp == null ? 1.0 : Math.max(0.0, Math.min(1.0, pp / 40.0)));
+		
 		final int pr = action.getPriority();
-		final double prNorm = pr <= -1 ? 0.0 : (pr >= 1 ? 1.0 : 0.5);
+		final double prNorm = pr <= -1 ? 0.0 : 
+		                     (pr >= 1 ? 1.0 : 
+		                      (pr + 1.0) / 2.0);
 		dst.add(prNorm);
+		dst.add(pr < 0 ? 1.0 : 0.0);
+		dst.add(pr == 0 ? 1.0 : 0.0);
+		dst.add(pr > 0 ? 1.0 : 0.0);
+		
 		final int cr = action.getCriticalHitRatio();
 		dst.add(Math.max(0.0, Math.min(1.0, cr / 2.0)));
 

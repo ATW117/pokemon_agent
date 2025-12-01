@@ -17,6 +17,7 @@ import edu.bu.pas.pokemon.nn.layers.ReLU;  // some activations (below too)
 import edu.bu.pas.pokemon.nn.layers.Tanh;
 import edu.bu.pas.pokemon.nn.layers.Sigmoid;
 import edu.bu.pas.pokemon.core.Move;
+import edu.bu.pas.pokemon.core.SwitchMove;
 import edu.bu.pas.pokemon.training.data.ReplayBuffer;
 import edu.bu.pas.pokemon.core.Team.TeamView;
 import edu.bu.pas.pokemon.core.Pokemon.PokemonView;
@@ -43,8 +44,8 @@ public class PolicyAgent
     private boolean isTraining; 
     
     private Model targetNetwork;
-    private int targetUpdateFrequency; 
-    private int targetUpdateCounter; 
+    private int targetUpdateFrequency;
+    private int nextTargetUpdateStep;
     private int gamesPlayed = 0;
     private int gamesWon = 0;
     private static int globalTrainingStepCount = 0;
@@ -58,8 +59,8 @@ public class PolicyAgent
         this.epsilonDecaySteps = 1000000;
         this.isTraining = true; 
         this.targetNetwork = null;
-        this.targetUpdateFrequency = 1000; 
-        this.targetUpdateCounter = 0;
+        this.targetUpdateFrequency = 10000; 
+        this.nextTargetUpdateStep = this.targetUpdateFrequency;
         
     }
     
@@ -121,7 +122,7 @@ public class PolicyAgent
     @Override
     public Model initModel()
     {
-        final int N_INPUT = 284;
+        final int N_INPUT = 291;
         Sequential qFunction = new Sequential();
         qFunction.add(new Dense(N_INPUT, 128));
         qFunction.add(new ReLU());
@@ -284,6 +285,34 @@ public class PolicyAgent
     private double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
     }
+    
+    private List<MoveView> getAllLegalMoves(BattleView view) {
+        TeamView myTeam = this.getMyTeamView(view);
+        if (myTeam == null) {
+            return new ArrayList<>();
+        }
+        
+        PokemonView active = myTeam.getActivePokemonView();
+        if (active == null) {
+            return new ArrayList<>();
+        }
+        
+        List<MoveView> legalMoves = new ArrayList<>(active.getAvailableMoves());
+        
+        int activeIdx = myTeam.getActivePokemonIdx();
+        for (int i = 0; i < myTeam.size(); i++) {
+            if (i != activeIdx) {
+                PokemonView pokemon = myTeam.getPokemonView(i);
+                if (pokemon != null && !pokemon.hasFainted()) {
+                    SwitchMove switchMove = new SwitchMove(i);
+                    legalMoves.add(switchMove.getView());
+                }
+            }
+        }
+        
+        return legalMoves;
+    }
+    
     @Override
     public MoveView getMove(BattleView view)
     {
@@ -319,17 +348,8 @@ public class PolicyAgent
             logEpsilonIfNeeded();
         }
         
-        TeamView myTeam = this.getMyTeamView(view);
-        if (myTeam == null) {
-            return null;
-        }
+        List<MoveView> legalMoves = getAllLegalMoves(view);
         
-        PokemonView active = myTeam.getActivePokemonView();
-        if (active == null) {
-            return null;
-        }
-        
-        List<MoveView> legalMoves = active.getAvailableMoves();
         if (legalMoves == null || legalMoves.isEmpty()) {
             return this.argmax(view);
         }
@@ -350,10 +370,14 @@ public class PolicyAgent
     @Override
     public Matrix makeGroundTruth(ReplayBuffer buffer, double discountFactor, RewardFunction rewardFunction)
     {
-        targetUpdateCounter++;
-        if (targetUpdateCounter >= targetUpdateFrequency) {
+        if (globalTrainingStepCount >= nextTargetUpdateStep) {
+            System.err.println(String.format(
+                "[TARGET_UPDATE] Steps=%d. Updating target network.", 
+                globalTrainingStepCount
+            ));
+            
             updateTargetNetwork();
-            targetUpdateCounter = 0;
+            nextTargetUpdateStep = globalTrainingStepCount + targetUpdateFrequency;
         }
         
         Matrix ygroundTruth = Matrix.zeros(buffer.size(), 1);
@@ -367,16 +391,7 @@ public class PolicyAgent
             if (nextState == null || nextState.isOver()){
                 ygroundTruth.set(rIdx, 0, reward);
             }else{
-                TeamView myTeam = this.getMyTeamView(nextState);
-                PokemonView active = myTeam.getActivePokemonView();
-                int numMoves = active.getAvailableMoves().size();
-                List<MoveView> legalMoves = new ArrayList<>();
-                for (int i = 0; i < numMoves; i++){
-                    MoveView move = active.getAvailableMoves().get(i);
-                    if (move != null){
-                        legalMoves.add(move);
-                    }
-                }
+                List<MoveView> legalMoves = getAllLegalMoves(nextState);
                 
                 if (legalMoves.isEmpty()) {
                     ygroundTruth.set(rIdx, 0, reward);
@@ -442,25 +457,9 @@ public class PolicyAgent
             }
         }
         
-        TeamView myTeam = this.getMyTeamView(view);
-        PokemonView active = myTeam.getActivePokemonView();
-        if (active == null) {
-            return null;
-        }
+        List<MoveView> legalMoves = getAllLegalMoves(view);
         
-        List<MoveView> availableMoves = active.getAvailableMoves();
-        if (availableMoves == null || availableMoves.isEmpty()) {
-            return null;
-        }
-        
-        List<MoveView> legalMoves = new ArrayList<>();
-        for (MoveView move : availableMoves) {
-            if (move != null) {
-                legalMoves.add(move);
-            }
-        }
-        
-        if (legalMoves.isEmpty()) {
+        if (legalMoves == null || legalMoves.isEmpty()) {
             return null;
         }
         
@@ -486,17 +485,6 @@ public class PolicyAgent
         
         return bestMove;
     }
-
-    @Override
-    public void train(){
-        setTrainingMode(true);
-    }
-    
-    @Override
-    public void eval(){
-        setTrainingMode(false);
-    }
-
 
     @Override
     public void afterGameEnds(BattleView view)

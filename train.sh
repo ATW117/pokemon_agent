@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #$ -N pokemon_train
 #$ -P cs440
-#$ -l h_rt=72:00:00
+#$ -l h_rt=168:00:00
 #$ -pe omp 8
 #$ -l mem_per_core=8G
 #$ -j y
@@ -30,7 +30,7 @@ java -Xmx12g -XX:+UseG1GC \
   src.pas.pokemon.agents.SelfPlayPolicyAgent \
   edu.bu.pas.pokemon.agents.RandomAgent \
   edu.bu.pas.pokemon.agents.AggroAgent \
-  src.pas.pokemon.agents.SelfPlayPolicyAgent \
+  edu.bu.pas.pokemon.agents.Drac5290Agent \
   -p 2000 \
   -t 15 \
   -v 5 \
@@ -39,5 +39,5 @@ java -Xmx12g -XX:+UseG1GC \
   -b 20000 \
   -r OLDEST \
   -g 0.99 \
-  -o params/fast_model 2>&1 | \
+  -o params/model_params 2>&1 | \
   tee "$RUN_LOG" | tee -a "$SELFPLAY_METRICS"

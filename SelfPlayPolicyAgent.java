@@ -8,6 +8,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -46,65 +47,76 @@ public class SelfPlayPolicyAgent extends PolicyAgent
         if (!loadHistoricalModel()) {
             System.err.println("[SELFPLAY] No historical model loaded; using freshly initialized weights.");
         }
+        this.setTrainingMode(false);
     }
 
     private boolean loadHistoricalModel() {
-        File[] recentModels = selectRecentModels();
-        if (recentModels == null || recentModels.length == 0) {
+        List<ModelCandidate> candidates = buildCandidates();
+        if (candidates.isEmpty()) {
             System.err.println("[SELFPLAY] No checkpoint files found in directory: " + getModelDir());
             return false;
         }
-
-        String metricsPath = getConfig("selfplay.metrics", "SELFPLAY_METRICS", "logs/training.log");
-        Map<Integer, Double> winRates = loadWinRates(metricsPath);
-        ModelCandidate candidate = pickCandidate(recentModels, winRates);
-        if (candidate == null) {
-            System.err.println("[SELFPLAY] Failed to pick a checkpoint candidate.");
-            return false;
+        List<ModelCandidate> pool = new ArrayList<>(candidates);
+        while (!pool.isEmpty()) {
+            ModelCandidate candidate = pickCandidate(pool);
+            if (candidate == null) {
+                break;
+            }
+            if (loadModelFromFile(candidate)) {
+                return true;
+            }
+            System.err.println("[SELFPLAY] Skipping incompatible checkpoint '" + candidate.file.getName() + "'");
+            pool.remove(candidate);
         }
-        return loadModelFromFile(candidate);
+        return false;
     }
 
-    private File[] selectRecentModels() {
+    private List<ModelCandidate> buildCandidates() {
         File dir = new File(getModelDir());
         if (!dir.exists() || !dir.isDirectory()) {
-            return null;
+            return Collections.emptyList();
         }
         File[] models = dir.listFiles((d, name) -> name != null && name.endsWith(".model"));
         if (models == null || models.length == 0) {
-            return null;
+            return Collections.emptyList();
         }
         Arrays.sort(models, Comparator.comparingLong(File::lastModified).reversed());
         int limit = Math.min(models.length, getSampleSize());
-        return Arrays.copyOf(models, limit);
-    }
-
-    private ModelCandidate pickCandidate(File[] candidates, Map<Integer, Double> winRates) {
-        List<ModelCandidate> weighted = new ArrayList<>();
-        for (File file : candidates) {
+        String metricsPath = getConfig("selfplay.metrics", "SELFPLAY_METRICS", "logs/training.log");
+        Map<Integer, Double> winRates = loadWinRates(metricsPath);
+        List<ModelCandidate> candidates = new ArrayList<>();
+        for (int i = 0; i < limit; i++) {
+            File file = models[i];
             int cycle = extractCycleNumber(file.getName());
             double score = winRates.getOrDefault(cycle, 0.0);
-            weighted.add(new ModelCandidate(file, score, cycle));
+            candidates.add(new ModelCandidate(file, score, cycle));
+        }
+        return candidates;
+    }
+
+    private ModelCandidate pickCandidate(List<ModelCandidate> pool) {
+        if (pool.isEmpty()) {
+            return null;
         }
         double totalWeight = 0.0;
-        double[] weights = new double[weighted.size()];
-        for (int i = 0; i < weighted.size(); i++) {
-            double w = Math.max(MIN_WEIGHT, weighted.get(i).score);
+        double[] weights = new double[pool.size()];
+        for (int i = 0; i < pool.size(); i++) {
+            double w = Math.max(MIN_WEIGHT, pool.get(i).score);
             weights[i] = w;
             totalWeight += w;
         }
         if (totalWeight <= 0) {
-            return weighted.isEmpty() ? null : weighted.get(0);
+            return pool.get(0);
         }
         double pick = historyRng.nextDouble() * totalWeight;
         double running = 0.0;
-        for (int i = 0; i < weighted.size(); i++) {
+        for (int i = 0; i < pool.size(); i++) {
             running += weights[i];
             if (running >= pick) {
-                return weighted.get(i);
+                return pool.get(i);
             }
         }
-        return weighted.get(weighted.size() - 1);
+        return pool.get(pool.size() - 1);
     }
 
     private boolean loadModelFromFile(ModelCandidate candidate) {
