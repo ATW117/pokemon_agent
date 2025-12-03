@@ -16,6 +16,7 @@ import edu.bu.pas.pokemon.nn.layers.Dense; // fully connected layer
 import edu.bu.pas.pokemon.nn.layers.ReLU;  // some activations (below too)
 import edu.bu.pas.pokemon.nn.layers.Tanh;
 import edu.bu.pas.pokemon.nn.layers.Sigmoid;
+import edu.bu.pas.pokemon.nn.Parameter;
 import edu.bu.pas.pokemon.core.Move;
 import edu.bu.pas.pokemon.core.SwitchMove;
 import edu.bu.pas.pokemon.training.data.ReplayBuffer;
@@ -103,15 +104,21 @@ public class PolicyAgent
         }
         
         try {
-            String tempFile = "/tmp/target_network_copy_" + System.currentTimeMillis() + ".model";
-            this.getModel().save(tempFile);
-            targetNetwork.load(tempFile);
-            try {
-                java.io.File temp = new java.io.File(tempFile);
-                if (temp.exists()) {
-                    temp.delete();
-                }
-            } catch (Exception e) {
+            List<Parameter> mainParams = this.getModel().getParameters();
+            List<Parameter> targetParams = targetNetwork.getParameters();
+            
+            if (mainParams.size() != targetParams.size()) {
+                System.err.println("Warning: Parameter count mismatch in target network update");
+                return;
+            }
+            
+            for (int i = 0; i < mainParams.size(); i++) {
+                Matrix mainValue = mainParams.get(i).getValue();
+                Matrix targetValue = targetParams.get(i).getValue();
+                
+                int numRows = mainValue.getShape().getNumRows();
+                int numCols = mainValue.getShape().getNumCols();
+                targetValue.copySlice(0, numRows, 0, numCols, mainValue);
             }
         } catch (Exception e) {
             System.err.println("Error updating target network: " + e.getMessage());
@@ -367,6 +374,30 @@ public class PolicyAgent
     public void setTrainingMode(boolean training) {
         this.isTraining = training;
     }
+    
+    // -----------------------------------------------------------------
+    // FIX 1: Implement train() and eval() as per the professor's post
+    // -----------------------------------------------------------------
+    
+    @Override
+    public void train()
+    {
+        // Enable exploration (epsilon-greedy) for training games
+        this.setTrainingMode(true);
+    }
+
+    @Override
+    public void eval()
+    {
+        // Disable exploration (use argmax) for evaluation games
+        this.setTrainingMode(false);
+    }
+    
+    // -----------------------------------------------------------------
+    // FIX 2: Re-write makeGroundTruth to use mini-batching
+    // This fixes the OutOfMemoryError and the slowness.
+    // -----------------------------------------------------------------
+    
     @Override
     public Matrix makeGroundTruth(ReplayBuffer buffer, double discountFactor, RewardFunction rewardFunction)
     {
@@ -381,6 +412,17 @@ public class PolicyAgent
         }
         
         Matrix ygroundTruth = Matrix.zeros(buffer.size(), 1);
+        Model networkToUse = (targetNetwork != null) ? targetNetwork : this.getModel();
+        
+        // Define a batch size for processing the ground truth
+        // This is separate from the training mini-batch size
+        final int GROUND_TRUTH_BATCH_SIZE = 256; 
+
+        // Lists to hold the inputs for one mini-batch
+        List<Integer> stateIndices = new ArrayList<>(GROUND_TRUTH_BATCH_SIZE);
+        List<Matrix> allInputs = new ArrayList<>();
+        List<Integer> moveCountsPerState = new ArrayList<>(GROUND_TRUTH_BATCH_SIZE);
+
         for (int rIdx = 0; rIdx < buffer.size(); rIdx++){
             BattleView state = buffer.getState(rIdx);
             MoveView action = buffer.getAction(rIdx);
@@ -390,41 +432,152 @@ public class PolicyAgent
             
             if (nextState == null || nextState.isOver()){
                 ygroundTruth.set(rIdx, 0, reward);
-            }else{
-                List<MoveView> legalMoves = getAllLegalMoves(nextState);
+                continue;
+            }
+
+            List<MoveView> legalMoves = getAllLegalMoves(nextState);
                 
-                if (legalMoves.isEmpty()) {
-                    ygroundTruth.set(rIdx, 0, reward);
-                    continue;
+            if (legalMoves.isEmpty()) {
+                ygroundTruth.set(rIdx, 0, reward);
+                continue;
+            }
+                
+            // Collect inputs for this state's legal moves
+            List<Matrix> currentMoveInputs = new ArrayList<>(legalMoves.size());
+            for (MoveView move : legalMoves) {
+                try {
+                    Matrix input = this.getModelInput(nextState, move);
+                    currentMoveInputs.add(input);
+                } catch (Exception e) {
+                    // Ignore this move if input generation fails
                 }
+            }
+
+            // If we have valid moves, add them to the batch
+            if (!currentMoveInputs.isEmpty()) {
+                stateIndices.add(rIdx);
+                allInputs.addAll(currentMoveInputs);
+                moveCountsPerState.add(currentMoveInputs.size());
+            } else {
+                // No valid moves, just set reward
+                ygroundTruth.set(rIdx, 0, reward);
+            }
+            
+            // Process the batch if it's full OR it's the last sample
+            boolean isLastSample = (rIdx == buffer.size() - 1);
+            if ((stateIndices.size() >= GROUND_TRUTH_BATCH_SIZE || (isLastSample && !stateIndices.isEmpty()))) {
+                processGroundTruthBatch(
+                    ygroundTruth, buffer, rewardFunction, discountFactor, networkToUse,
+                    stateIndices, allInputs, moveCountsPerState
+                );
                 
-                Double maxQMain = null;
-                MoveView bestAction = null;
-                for (MoveView move : legalMoves) {
-                    double qValMain = this.eval(nextState, move);
-                    if (maxQMain == null || qValMain > maxQMain) {
-                        maxQMain = qValMain;
-                        bestAction = move;
-                    }
-                }
-                
-                double targetQValue = 0.0;
-                if (bestAction != null && targetNetwork != null) {
-                    try {
-                        Matrix input = this.getModelInput(nextState, bestAction);
-                        Matrix output = targetNetwork.forward(input);
-                        targetQValue = output.get(0, 0);
-                    } catch (Exception e) {
-                        targetQValue = maxQMain;
-                    }
-                } else if (bestAction != null) {
-                    targetQValue = maxQMain;
-                }
-                
-                ygroundTruth.set(rIdx, 0, reward + discountFactor * targetQValue);
+                // Clear lists for the next batch
+                stateIndices.clear();
+                allInputs.clear();
+                moveCountsPerState.clear();
             }
         }
         return ygroundTruth;
+    }
+
+    /**
+     * Helper method to process a mini-batch of ground truth calculations.
+     * This is where the batched forward pass happens.
+     */
+    private void processGroundTruthBatch(Matrix ygroundTruth, ReplayBuffer buffer, RewardFunction rewardFunction,
+                                         double discountFactor, Model networkToUse, List<Integer> stateIndices,
+                                         List<Matrix> allInputs, List<Integer> moveCountsPerState)
+    {
+        try {
+            // 1. Stack all inputs into one large matrix for this batch
+            int totalMoves = allInputs.size();
+            int numCols = allInputs.get(0).getShape().getNumCols();
+            Matrix batchedInput = Matrix.zeros(totalMoves, numCols);
+            
+            for (int i = 0; i < totalMoves; i++) {
+                batchedInput.copySlice(i, i + 1, 0, numCols, allInputs.get(i));
+            }
+
+            // 2. Perform ONE batched forward pass
+            Matrix batchedOutput = networkToUse.forward(batchedInput);
+
+            // 3. Extract max Q-values and set ground truth
+            int outputIdx = 0;
+            for (int i = 0; i < stateIndices.size(); i++) {
+                int rIdx = stateIndices.get(i);
+                int numMoves = moveCountsPerState.get(i);
+                
+                Double maxQValue = null;
+                for (int m = 0; m < numMoves; m++) {
+                    double qVal = batchedOutput.get(outputIdx, 0);
+                    if (maxQValue == null || qVal > maxQValue) {
+                        maxQValue = qVal;
+                    }
+                    outputIdx++;
+                }
+                
+                // Get reward (we must re-fetch it here)
+                BattleView state = buffer.getState(rIdx);
+                MoveView action = buffer.getAction(rIdx);
+                BattleView nextState = buffer.getNextState(rIdx);
+                double reward = rewardFunction.getStateActionStateReward(state, action, nextState);
+                
+                if (maxQValue != null) {
+                    ygroundTruth.set(rIdx, 0, reward + discountFactor * maxQValue);
+                } else {
+                    ygroundTruth.set(rIdx, 0, reward); // Should not happen, but safe
+                }
+            }
+
+        } catch (Exception e) {
+            // Fallback: If batching fails (e.g., OOM on a *huge* batch),
+            // process individually. This is slow but prevents a crash.
+            System.err.println("Warning: Ground truth batch processing failed, falling back to individual. " + e.getMessage());
+            processGroundTruthIndividually(
+                ygroundTruth, buffer, rewardFunction, discountFactor, networkToUse, stateIndices
+            );
+        }
+    }
+
+    /**
+     * Fallback helper to process ground truth sample by sample (slow, but safe).
+     * This is the "original" slow way, used only if batching fails.
+     */
+    private void processGroundTruthIndividually(Matrix ygroundTruth, ReplayBuffer buffer, RewardFunction rewardFunction,
+                                                double discountFactor, Model networkToUse, List<Integer> stateIndices)
+    {
+        for (int rIdx : stateIndices) {
+            BattleView state = buffer.getState(rIdx);
+            MoveView action = buffer.getAction(rIdx);
+            BattleView nextState = buffer.getNextState(rIdx);
+            double reward = rewardFunction.getStateActionStateReward(state, action, nextState);
+            
+            List<MoveView> legalMoves = getAllLegalMoves(nextState);
+            if (legalMoves.isEmpty()) {
+                ygroundTruth.set(rIdx, 0, reward);
+                continue;
+            }
+
+            Double maxQValue = null;
+            for (MoveView move : legalMoves) {
+                try {
+                    Matrix input = this.getModelInput(nextState, move);
+                    Matrix output = networkToUse.forward(input);
+                    double qVal = output.get(0, 0);
+                    if (maxQValue == null || qVal > maxQValue) {
+                        maxQValue = qVal;
+                    }
+                } catch (Exception e) {
+                    // Skip this move
+                }
+            }
+            
+            if (maxQValue != null) {
+                ygroundTruth.set(rIdx, 0, reward + discountFactor * maxQValue);
+            } else {
+                ygroundTruth.set(rIdx, 0, reward);
+            }
+        }
     }
 
     @Override
@@ -466,15 +619,21 @@ public class PolicyAgent
         Double maxVal = null;
         MoveView bestMove = null;
         
+        // This loop does NOT need to be batched.
+        // It's only 9 moves, not 90,000. It's already fast.
         for (MoveView move : legalMoves) {
             try {
-                double qVal = this.eval(view, move);
+                // The simple eval() call is correct.
+                // It just calls getModelInput() and forward()
+                double qVal = this.eval(view, move); 
+                
                 if (maxVal == null || qVal > maxVal) {
                     maxVal = qVal;
                     bestMove = move;
                 }
             } catch (Exception e) {
-                System.err.println("Warning: eval failed for move: " + e.getMessage());
+                // Catching regular Exceptions is OK
+                System.err.println("Warning: eval failed for move, skipping: " + e.getMessage());
                 continue;
             }
         }
@@ -508,7 +667,6 @@ public class PolicyAgent
         gamesWon++;
     }
     
-        // Log every 100 games
         if (gamesPlayed % 100 == 0) {
         double winRate = (double) gamesWon / gamesPlayed;
         System.err.println(String.format("Games: %d | Win Rate: %.3f | Epsilon: %.3f", 
