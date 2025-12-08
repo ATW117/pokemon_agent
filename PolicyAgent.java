@@ -57,7 +57,7 @@ public class PolicyAgent
         this.random = new Random();
         this.epsilonStart = 1.0;
         this.epsilonEnd = 0.1;
-        this.epsilonDecaySteps = 1000000;
+        this.epsilonDecaySteps = 4000000;
         this.isTraining = true; 
         this.targetNetwork = null;
         this.targetUpdateFrequency = 10000; 
@@ -143,45 +143,81 @@ public class PolicyAgent
     public Integer chooseNextPokemon(BattleView view)
     {
         TeamView myTeam = this.getMyTeamView(view);
-        TeamView oppTeam = this.getOpponentTeamView(view);
-        PokemonView oppActive = (oppTeam == null) ? null : oppTeam.getActivePokemonView();
+        if (myTeam == null) {
+            return null;
+        }
+        
+        // Ensure model is initialized before using it
+        if (this.getSensorArray() == null) {
+            this.initializeSenses(null);
+        }
+        if (this.getModel() == null) {
+            try {
+                Model model = this.initModel();
+                this.setModel(model);
+                if (this.targetNetwork == null) {
+                    this.targetNetwork = this.initModel();
+                    this.updateTargetNetwork();
+                }
+            } catch (Exception e) {
+                System.err.println("Error initializing model in chooseNextPokemon: " + e.getMessage());
+                // Fallback to first non-fainted Pokemon if model initialization fails
+                for (int i = 0; i < myTeam.size(); i++) {
+                    PokemonView pokemon = myTeam.getPokemonView(i);
+                    if (pokemon != null && !pokemon.hasFainted()) {
+                        return i;
+                    }
+                }
+                return null;
+            }
+        }
+        
+        // Use the neural network to choose which Pokemon to switch to
+        // This keeps the policy consistent - the network has learned Q-values
+        // for switching to each Pokemon, so we should use those here too
         Integer bestIdx = null;
-        Double bestScore = Double.NEGATIVE_INFINITY;
-
-
-        for (int i = 0; i < myTeam.size(); i++){
-            PokemonView myPokemon = myTeam.getPokemonView(i);
-            if (myPokemon.hasFainted()){
+        Double bestQValue = null;
+        
+        // Get all non-fainted Pokemon indices
+        List<Integer> candidateIndices = new ArrayList<>();
+        for (int i = 0; i < myTeam.size(); i++) {
+            PokemonView pokemon = myTeam.getPokemonView(i);
+            if (pokemon != null && !pokemon.hasFainted()) {
+                candidateIndices.add(i);
+            }
+        }
+        
+        if (candidateIndices.isEmpty()) {
+            return null;
+        }
+        
+        // Evaluate each candidate using the neural network
+        // Create a SwitchMove for each and evaluate its Q-value
+        for (int idx : candidateIndices) {
+            try {
+                SwitchMove switchMove = new SwitchMove(idx);
+                MoveView switchMoveView = switchMove.getView();
+                
+                // Evaluate Q-value for this switch using the neural network
+                double qVal = this.eval(view, switchMoveView);
+                
+                if (bestQValue == null || qVal > bestQValue) {
+                    bestQValue = qVal;
+                    bestIdx = idx;
+                }
+            } catch (Exception e) {
+                // If evaluation fails, skip this Pokemon
+                System.err.println("Warning: Failed to evaluate switch to Pokemon " + idx + ": " + e.getMessage());
                 continue;
             }
-
-            double score = 0.0;
-            double hpFrac = (double) myPokemon.getCurrentStat(Stat.HP) / Math.max(1.0, (double) myPokemon.getInitialStat(Stat.HP));
-
-            score += 1.8 * hpFrac;
-            score += 0.4 * getNormalizedStat(myPokemon, Stat.SPD);
-
-            if (oppActive != null) {
-                double offensiveOutlook = estimateOffensivePotential(myPokemon, oppActive);
-                double defensiveRisk = estimateDefensiveRisk(myPokemon, oppActive);
-                score += 0.9 * offensiveOutlook;
-                score -= 0.7 * defensiveRisk;
-
-                if (myPokemon.getCurrentStat(Stat.SPD) > oppActive.getCurrentStat(Stat.SPD)) {
-                    score += 0.2;
-                }
-            }
-
-            score -= statusPenalty(myPokemon.getNonVolatileStatus());
-
-            if (score > bestScore){
-                bestScore = score;
-                bestIdx = i;
-            }
-
-    }
-
-    return bestIdx;
+        }
+        
+        // Fallback to first available Pokemon if all evaluations failed
+        if (bestIdx == null && !candidateIndices.isEmpty()) {
+            return candidateIndices.get(0);
+        }
+        
+        return bestIdx;
     }
 
     private double statusPenalty(NonVolatileStatus status) {

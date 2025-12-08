@@ -25,12 +25,12 @@ public class CustomRewardFunction
 
     public double getLowerBound()
     {
-        return -5.0;
+        return -50.0;  // Scaled up 10x for better gradient signals and visualization
     }
 
     public double getUpperBound()
     {
-        return 5.0;
+        return 50.0;  // Scaled up 10x for better gradient signals and visualization
     }
 
     public double getStateReward(final BattleView state)
@@ -67,25 +67,25 @@ public class CustomRewardFunction
 
         double statusReward = 0.0;
         if (myStatusBefore != NonVolatileStatus.NONE && myStatusAfter == NonVolatileStatus.NONE) {
-            statusReward += 0.3;  
+            statusReward += 3.0;  // Scaled 10x: 0.3 -> 3.0
         }
     if (oppStatusBefore == NonVolatileStatus.NONE && oppStatusAfter != NonVolatileStatus.NONE) {
         if (oppStatusAfter == NonVolatileStatus.SLEEP || oppStatusAfter == NonVolatileStatus.FREEZE) {
-            statusReward += 0.6;
+            statusReward += 6.0;  // Scaled 10x: 0.6 -> 6.0
         } else if (oppStatusAfter == NonVolatileStatus.TOXIC) {
-            statusReward += 0.5;  
+            statusReward += 5.0;  // Scaled 10x: 0.5 -> 5.0
         } else {
-            statusReward += 0.25; 
+            statusReward += 2.5;  // Scaled 10x: 0.25 -> 2.5
         }
     }
     
     if (myStatusBefore == NonVolatileStatus.NONE && myStatusAfter != NonVolatileStatus.NONE) {
         if (myStatusAfter == NonVolatileStatus.SLEEP || myStatusAfter == NonVolatileStatus.FREEZE) {
-            statusReward -= 0.6;
+            statusReward -= 6.0;  // Scaled 10x: -0.6 -> -6.0
         } else if (myStatusAfter == NonVolatileStatus.TOXIC) {
-            statusReward -= 0.5;
+            statusReward -= 5.0;  // Scaled 10x: -0.5 -> -5.0
         } else {
-            statusReward -= 0.25;
+            statusReward -= 2.5;  // Scaled 10x: -0.25 -> -2.5
         }
     }
         
@@ -95,7 +95,7 @@ public class CustomRewardFunction
         double myHpAfter   = hpFrac(myTeamAfter);
         double oppHpAfter  = hpFrac(oppTeamAfter);
     
-        double hpReward = 1.5 * ((myHpAfter - oppHpAfter) - (myHpBefore - oppHpBefore));
+        double hpReward = 15.0 * ((myHpAfter - oppHpAfter) - (myHpBefore - oppHpBefore));  // Scaled 10x: 1.5 -> 15.0
     
         int myFaintBefore  = faintedCount(myTeamBefore);
         int oppFaintBefore = faintedCount(oppTeamBefore);
@@ -106,8 +106,8 @@ public class CustomRewardFunction
         int oppFaintDelta = oppFaintAfter - oppFaintBefore;
     
         double koReward = 0.0;
-        if (oppFaintDelta > 0) koReward += 2.0 * oppFaintDelta;
-        if (myFaintDelta  > 0) koReward -= 2.0 * myFaintDelta;
+        if (oppFaintDelta > 0) koReward += 20.0 * oppFaintDelta;  // Scaled 10x: 2.0 -> 20.0
+        if (myFaintDelta  > 0) koReward -= 20.0 * myFaintDelta;   // Scaled 10x: -2.0 -> -20.0
     
         double terminalReward = 0.0;
         if (nextState.isOver()) {
@@ -115,9 +115,9 @@ public class CustomRewardFunction
             boolean oppLost = (oppFaintAfter == oppTeamAfter.size());
         
             if (iLost && !oppLost) {
-                terminalReward -= 4.0;
+                terminalReward -= 40.0;  // Scaled 10x: -4.0 -> -40.0
             } else if (!iLost && oppLost) {
-                terminalReward += 4.0;
+                terminalReward += 40.0;   // Scaled 10x: +4.0 -> +40.0
             }else{
                 terminalReward += 0.0;
             }
