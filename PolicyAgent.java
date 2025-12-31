@@ -51,14 +51,16 @@ public class PolicyAgent
     private int gamesWon = 0;
     private static int globalTrainingStepCount = 0;
     
+    private int consecutiveSwitchChoices = 0;
+    
     public PolicyAgent()
     {
         super();
         this.random = new Random();
         this.epsilonStart = 1.0;
         this.epsilonEnd = 0.1;
-        this.epsilonDecaySteps = 4000000;
-        this.isTraining = true; 
+        this.epsilonDecaySteps = 10000000;
+        this.isTraining = false; 
         this.targetNetwork = null;
         this.targetUpdateFrequency = 10000; 
         this.nextTargetUpdateStep = this.targetUpdateFrequency;
@@ -143,81 +145,45 @@ public class PolicyAgent
     public Integer chooseNextPokemon(BattleView view)
     {
         TeamView myTeam = this.getMyTeamView(view);
-        if (myTeam == null) {
-            return null;
-        }
-        
-        // Ensure model is initialized before using it
-        if (this.getSensorArray() == null) {
-            this.initializeSenses(null);
-        }
-        if (this.getModel() == null) {
-            try {
-                Model model = this.initModel();
-                this.setModel(model);
-                if (this.targetNetwork == null) {
-                    this.targetNetwork = this.initModel();
-                    this.updateTargetNetwork();
-                }
-            } catch (Exception e) {
-                System.err.println("Error initializing model in chooseNextPokemon: " + e.getMessage());
-                // Fallback to first non-fainted Pokemon if model initialization fails
-                for (int i = 0; i < myTeam.size(); i++) {
-                    PokemonView pokemon = myTeam.getPokemonView(i);
-                    if (pokemon != null && !pokemon.hasFainted()) {
-                        return i;
-                    }
-                }
-                return null;
-            }
-        }
-        
-        // Use the neural network to choose which Pokemon to switch to
-        // This keeps the policy consistent - the network has learned Q-values
-        // for switching to each Pokemon, so we should use those here too
+        TeamView oppTeam = this.getOpponentTeamView(view);
+        PokemonView oppActive = (oppTeam == null) ? null : oppTeam.getActivePokemonView();
         Integer bestIdx = null;
-        Double bestQValue = null;
-        
-        // Get all non-fainted Pokemon indices
-        List<Integer> candidateIndices = new ArrayList<>();
-        for (int i = 0; i < myTeam.size(); i++) {
-            PokemonView pokemon = myTeam.getPokemonView(i);
-            if (pokemon != null && !pokemon.hasFainted()) {
-                candidateIndices.add(i);
-            }
-        }
-        
-        if (candidateIndices.isEmpty()) {
-            return null;
-        }
-        
-        // Evaluate each candidate using the neural network
-        // Create a SwitchMove for each and evaluate its Q-value
-        for (int idx : candidateIndices) {
-            try {
-                SwitchMove switchMove = new SwitchMove(idx);
-                MoveView switchMoveView = switchMove.getView();
-                
-                // Evaluate Q-value for this switch using the neural network
-                double qVal = this.eval(view, switchMoveView);
-                
-                if (bestQValue == null || qVal > bestQValue) {
-                    bestQValue = qVal;
-                    bestIdx = idx;
-                }
-            } catch (Exception e) {
-                // If evaluation fails, skip this Pokemon
-                System.err.println("Warning: Failed to evaluate switch to Pokemon " + idx + ": " + e.getMessage());
+        Double bestScore = Double.NEGATIVE_INFINITY;
+
+
+        for (int i = 0; i < myTeam.size(); i++){
+            PokemonView myPokemon = myTeam.getPokemonView(i);
+            if (myPokemon.hasFainted()){
                 continue;
             }
-        }
-        
-        // Fallback to first available Pokemon if all evaluations failed
-        if (bestIdx == null && !candidateIndices.isEmpty()) {
-            return candidateIndices.get(0);
-        }
-        
-        return bestIdx;
+
+            double score = 0.0;
+            double hpFrac = (double) myPokemon.getCurrentStat(Stat.HP) / Math.max(1.0, (double) myPokemon.getInitialStat(Stat.HP));
+
+            score += 1.8 * hpFrac;
+            score += 0.4 * getNormalizedStat(myPokemon, Stat.SPD);
+
+            if (oppActive != null) {
+                double offensiveOutlook = estimateOffensivePotential(myPokemon, oppActive);
+                double defensiveRisk = estimateDefensiveRisk(myPokemon, oppActive);
+                score += 0.9 * offensiveOutlook;
+                score -= 0.7 * defensiveRisk;
+
+                if (myPokemon.getCurrentStat(Stat.SPD) > oppActive.getCurrentStat(Stat.SPD)) {
+                    score += 0.2;
+                }
+            }
+
+            score -= statusPenalty(myPokemon.getNonVolatileStatus());
+
+            if (score > bestScore){
+                bestScore = score;
+                bestIdx = i;
+            }
+
+    }
+
+    return bestIdx;
     }
 
     private double statusPenalty(NonVolatileStatus status) {
@@ -391,49 +357,71 @@ public class PolicyAgent
             logEpsilonIfNeeded();
         }
         
+        TeamView myTeam = this.getMyTeamView(view);
+        PokemonView active = (myTeam != null) ? myTeam.getActivePokemonView() : null;
+        List<MoveView> attackMoves = (active != null) ? active.getAvailableMoves() : new ArrayList<>();
+        
+        // During eval: only consider attacks (faster + no stalling)
+        if (!isTraining && attackMoves != null && !attackMoves.isEmpty()) {
+            return argmaxFromList(view, attackMoves);
+        }
+        
         List<MoveView> legalMoves = getAllLegalMoves(view);
+        
+        if (consecutiveSwitchChoices >= 2 && attackMoves != null && !attackMoves.isEmpty()) {
+            List<MoveView> filteredMoves = new ArrayList<>();
+            for (MoveView move : legalMoves) {
+                if (attackMoves.contains(move)) {
+                    filteredMoves.add(move);
+                }
+            }
+            if (!filteredMoves.isEmpty()) {
+                legalMoves = filteredMoves;
+            }
+        }
         
         if (legalMoves == null || legalMoves.isEmpty()) {
             return this.argmax(view);
         }
         
+        MoveView chosen;
         if (isTraining) {
             double epsilon = getCurrentEpsilon();
             if (random.nextDouble() < epsilon) {
-                return legalMoves.get(random.nextInt(legalMoves.size()));
+                chosen = legalMoves.get(random.nextInt(legalMoves.size()));
+            } else {
+                chosen = argmaxFromList(view, legalMoves);
             }
+        } else {
+            chosen = argmaxFromList(view, legalMoves);
         }
         
-        return this.argmax(view);
+        boolean isSwitch = (chosen != null && attackMoves != null && !attackMoves.contains(chosen));
+        if (isSwitch) {
+            consecutiveSwitchChoices++;
+        } else {
+            consecutiveSwitchChoices = 0;
+        }
+        
+        return chosen;
     }
     
     public void setTrainingMode(boolean training) {
         this.isTraining = training;
     }
-    
-    // -----------------------------------------------------------------
-    // FIX 1: Implement train() and eval() as per the professor's post
-    // -----------------------------------------------------------------
-    
+
     @Override
     public void train()
     {
-        // Enable exploration (epsilon-greedy) for training games
         this.setTrainingMode(true);
     }
 
     @Override
     public void eval()
     {
-        // Disable exploration (use argmax) for evaluation games
         this.setTrainingMode(false);
     }
-    
-    // -----------------------------------------------------------------
-    // FIX 2: Re-write makeGroundTruth to use mini-batching
-    // This fixes the OutOfMemoryError and the slowness.
-    // -----------------------------------------------------------------
-    
+
     @Override
     public Matrix makeGroundTruth(ReplayBuffer buffer, double discountFactor, RewardFunction rewardFunction)
     {
@@ -450,11 +438,8 @@ public class PolicyAgent
         Matrix ygroundTruth = Matrix.zeros(buffer.size(), 1);
         Model networkToUse = (targetNetwork != null) ? targetNetwork : this.getModel();
         
-        // Define a batch size for processing the ground truth
-        // This is separate from the training mini-batch size
         final int GROUND_TRUTH_BATCH_SIZE = 256; 
 
-        // Lists to hold the inputs for one mini-batch
         List<Integer> stateIndices = new ArrayList<>(GROUND_TRUTH_BATCH_SIZE);
         List<Matrix> allInputs = new ArrayList<>();
         List<Integer> moveCountsPerState = new ArrayList<>(GROUND_TRUTH_BATCH_SIZE);
@@ -478,36 +463,29 @@ public class PolicyAgent
                 continue;
             }
                 
-            // Collect inputs for this state's legal moves
             List<Matrix> currentMoveInputs = new ArrayList<>(legalMoves.size());
             for (MoveView move : legalMoves) {
                 try {
                     Matrix input = this.getModelInput(nextState, move);
                     currentMoveInputs.add(input);
                 } catch (Exception e) {
-                    // Ignore this move if input generation fails
                 }
             }
 
-            // If we have valid moves, add them to the batch
             if (!currentMoveInputs.isEmpty()) {
                 stateIndices.add(rIdx);
                 allInputs.addAll(currentMoveInputs);
                 moveCountsPerState.add(currentMoveInputs.size());
             } else {
-                // No valid moves, just set reward
                 ygroundTruth.set(rIdx, 0, reward);
             }
             
-            // Process the batch if it's full OR it's the last sample
             boolean isLastSample = (rIdx == buffer.size() - 1);
             if ((stateIndices.size() >= GROUND_TRUTH_BATCH_SIZE || (isLastSample && !stateIndices.isEmpty()))) {
                 processGroundTruthBatch(
                     ygroundTruth, buffer, rewardFunction, discountFactor, networkToUse,
                     stateIndices, allInputs, moveCountsPerState
                 );
-                
-                // Clear lists for the next batch
                 stateIndices.clear();
                 allInputs.clear();
                 moveCountsPerState.clear();
@@ -516,16 +494,11 @@ public class PolicyAgent
         return ygroundTruth;
     }
 
-    /**
-     * Helper method to process a mini-batch of ground truth calculations.
-     * This is where the batched forward pass happens.
-     */
     private void processGroundTruthBatch(Matrix ygroundTruth, ReplayBuffer buffer, RewardFunction rewardFunction,
                                          double discountFactor, Model networkToUse, List<Integer> stateIndices,
                                          List<Matrix> allInputs, List<Integer> moveCountsPerState)
     {
         try {
-            // 1. Stack all inputs into one large matrix for this batch
             int totalMoves = allInputs.size();
             int numCols = allInputs.get(0).getShape().getNumCols();
             Matrix batchedInput = Matrix.zeros(totalMoves, numCols);
@@ -534,10 +507,8 @@ public class PolicyAgent
                 batchedInput.copySlice(i, i + 1, 0, numCols, allInputs.get(i));
             }
 
-            // 2. Perform ONE batched forward pass
             Matrix batchedOutput = networkToUse.forward(batchedInput);
 
-            // 3. Extract max Q-values and set ground truth
             int outputIdx = 0;
             for (int i = 0; i < stateIndices.size(); i++) {
                 int rIdx = stateIndices.get(i);
@@ -552,7 +523,6 @@ public class PolicyAgent
                     outputIdx++;
                 }
                 
-                // Get reward (we must re-fetch it here)
                 BattleView state = buffer.getState(rIdx);
                 MoveView action = buffer.getAction(rIdx);
                 BattleView nextState = buffer.getNextState(rIdx);
@@ -561,13 +531,11 @@ public class PolicyAgent
                 if (maxQValue != null) {
                     ygroundTruth.set(rIdx, 0, reward + discountFactor * maxQValue);
                 } else {
-                    ygroundTruth.set(rIdx, 0, reward); // Should not happen, but safe
+                    ygroundTruth.set(rIdx, 0, reward);
                 }
             }
 
         } catch (Exception e) {
-            // Fallback: If batching fails (e.g., OOM on a *huge* batch),
-            // process individually. This is slow but prevents a crash.
             System.err.println("Warning: Ground truth batch processing failed, falling back to individual. " + e.getMessage());
             processGroundTruthIndividually(
                 ygroundTruth, buffer, rewardFunction, discountFactor, networkToUse, stateIndices
@@ -575,10 +543,6 @@ public class PolicyAgent
         }
     }
 
-    /**
-     * Fallback helper to process ground truth sample by sample (slow, but safe).
-     * This is the "original" slow way, used only if batching fails.
-     */
     private void processGroundTruthIndividually(Matrix ygroundTruth, ReplayBuffer buffer, RewardFunction rewardFunction,
                                                 double discountFactor, Model networkToUse, List<Integer> stateIndices)
     {
@@ -604,7 +568,6 @@ public class PolicyAgent
                         maxQValue = qVal;
                     }
                 } catch (Exception e) {
-                    // Skip this move
                 }
             }
             
@@ -613,6 +576,64 @@ public class PolicyAgent
             } else {
                 ygroundTruth.set(rIdx, 0, reward);
             }
+        }
+    }
+
+    private MoveView argmaxFromList(BattleView view, List<MoveView> moves)
+    {
+        if (moves == null || moves.isEmpty()) {
+            return null;
+        }
+        
+        if (this.getSensorArray() == null) {
+            this.initializeSenses(null);
+        }
+        if (this.getModel() == null) {
+            try {
+                Model model = this.initModel();
+                this.setModel(model);
+                if (this.targetNetwork == null) {
+                    this.targetNetwork = this.initModel();
+                    this.updateTargetNetwork();
+                }
+            } catch (Exception e) {
+                System.err.println("Error initializing model in argmaxFromList: " + e.getMessage());
+                return moves.get(0);
+            }
+        }
+        
+        try {
+            int numMoves = moves.size();
+            List<Matrix> inputs = new ArrayList<>(numMoves);
+            
+            for (MoveView move : moves) {
+                Matrix input = this.getModelInput(view, move);
+                inputs.add(input);
+            }
+            
+            int numCols = inputs.get(0).getShape().getNumCols();
+            Matrix batchedInput = Matrix.zeros(numMoves, numCols);
+            for (int i = 0; i < numMoves; i++) {
+                batchedInput.copySlice(i, i + 1, 0, numCols, inputs.get(i));
+            }
+            
+            Matrix batchedOutput = this.getModel().forward(batchedInput);
+            
+            Double maxVal = null;
+            MoveView bestMove = null;
+            for (int i = 0; i < numMoves; i++) {
+                double qVal = batchedOutput.get(i, 0);
+                if (maxVal == null || qVal > maxVal) {
+                    maxVal = qVal;
+                    bestMove = moves.get(i);
+                }
+            }
+            
+            return (bestMove != null) ? bestMove : moves.get(0);
+            
+        } catch (Exception e) {
+            System.err.println("Warning: Batch inference failed in argmaxFromList, using first move: " + e.getMessage());
+            return moves.get(0);
         }
     }
 
@@ -647,38 +668,7 @@ public class PolicyAgent
         }
         
         List<MoveView> legalMoves = getAllLegalMoves(view);
-        
-        if (legalMoves == null || legalMoves.isEmpty()) {
-            return null;
-        }
-        
-        Double maxVal = null;
-        MoveView bestMove = null;
-        
-        // This loop does NOT need to be batched.
-        // It's only 9 moves, not 90,000. It's already fast.
-        for (MoveView move : legalMoves) {
-            try {
-                // The simple eval() call is correct.
-                // It just calls getModelInput() and forward()
-                double qVal = this.eval(view, move); 
-                
-                if (maxVal == null || qVal > maxVal) {
-                    maxVal = qVal;
-                    bestMove = move;
-                }
-            } catch (Exception e) {
-                // Catching regular Exceptions is OK
-                System.err.println("Warning: eval failed for move, skipping: " + e.getMessage());
-                continue;
-            }
-        }
-        
-        if (bestMove == null && !legalMoves.isEmpty()) {
-            return legalMoves.get(0);
-        }
-        
-        return bestMove;
+        return argmaxFromList(view, legalMoves);
     }
 
     @Override
@@ -686,28 +676,30 @@ public class PolicyAgent
     {
         gamesPlayed++;
     
-    TeamView myTeam = this.getMyTeamView(view);
-    TeamView oppTeam = this.getOpponentTeamView(view);
-    
-    int myFainted = 0;
-    int oppFainted = 0;
-    
-    for (int i = 0; i < myTeam.size(); i++) {
-        if (myTeam.getPokemonView(i).hasFainted()) myFainted++;
-    }
-    for (int i = 0; i < oppTeam.size(); i++) {
-        if (oppTeam.getPokemonView(i).hasFainted()) oppFainted++;
-    }
-    
-    if (oppFainted == oppTeam.size() && myFainted < myTeam.size()) {
-        gamesWon++;
-    }
-    
+        TeamView myTeam = this.getMyTeamView(view);
+        TeamView oppTeam = this.getOpponentTeamView(view);
+        
+        int myFainted = 0;
+        int oppFainted = 0;
+        
+        for (int i = 0; i < myTeam.size(); i++) {
+            if (myTeam.getPokemonView(i).hasFainted()) myFainted++;
+        }
+        for (int i = 0; i < oppTeam.size(); i++) {
+            if (oppTeam.getPokemonView(i).hasFainted()) oppFainted++;
+        }
+        
+        if (oppFainted == oppTeam.size() && myFainted < myTeam.size()) {
+            gamesWon++;
+        }
+        
+        consecutiveSwitchChoices = 0;
+        
         if (gamesPlayed % 100 == 0) {
-        double winRate = (double) gamesWon / gamesPlayed;
-        System.err.println(String.format("Games: %d | Win Rate: %.3f | Epsilon: %.3f", 
-            gamesPlayed, winRate, getCurrentEpsilon()));
-    }
+            double winRate = (double) gamesWon / gamesPlayed;
+            System.err.println(String.format("Games: %d | Win Rate: %.3f | Epsilon: %.3f", 
+                gamesPlayed, winRate, getCurrentEpsilon()));
+        }
     }
 
     private void logEpsilonIfNeeded() {
