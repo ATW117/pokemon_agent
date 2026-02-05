@@ -1,4 +1,3 @@
 src/pas/pokemon/rewards/CustomRewardFunction.java
 src/pas/pokemon/senses/CustomSensorArray.java
 src/pas/pokemon/agents/PolicyAgent.java
-src/pas/pokemon/agents/SelfPlayPolicyAgent.java
