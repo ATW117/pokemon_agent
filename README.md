@@ -140,8 +140,45 @@ Consecutive switch tracking to prevent degenerate policies
 - Type Effectiveness Integration: Offensive/defensive estimations explicitly compute type matchup multipliers, incorporating core Pokemon battle mechanics.
 - Status Prioritization: Higher rewards for SLEEP/FREEZE (most debilitating) and TOXIC (escalating damage) reflect competitive Pokemon strategy.
 
-Usage
+## Usage
 This code is designed to work with the BU course framework and is provided for reference purposes.
+
+Training the Agent
+The agent was trained using the included train.sh script on BU's Shared Computing Cluster:
+bashchmod +x train.sh
+./train.sh
+Training Configuration (from train.sh):
+
+- Parallel Training: 28 worker threads (-j 28)
+- Training Episodes: 5000 parallel games (-p 5000)
+- Opponents: RandomAgent and AggroAgent (random selection via -r RANDOM)
+- Replay Buffer Size: 50,000 transitions (-b 50000)
+- Training Frequency: Update every 50 steps (-u 50)
+- Batch Size: 256 samples (-m 256)
+- Discount Factor: 0.99 (-g 0.99)
+- Optimizer: Adam (-d adam)
+- Learning Rate: 1e-4 (-n 1.0E-4)
+- Validation Frequency: Every 5 training cycles (-v 5)
+
+The script automatically logs training progress to logs/training_32core_<timestamp>.log and saves model parameters to params/model_params_32core.
+SCC Setup
+
+Training was performed on BU's Shared Computing Cluster with a remote desktop session:
+- Requested compute resources (28+ CPU cores, sufficient memory)
+- Set up remote desktop environment
+- Compiled and ran the training script
+- Monitored training logs for convergence and win rate improvements
+
+## Future Improvements
+Potential enhancements could include:
+- Prioritized experience replay for more efficient learning
+- Learned switching policy (instead of heuristic)
+- Dueling DQN architecture for better value estimation
+- Multi-step returns for improved credit assignment
+- Ensemble models for robustness
+
+## Acknowledgments
+This project was completed as part of a BU AI course. The Pokemon battle framework was provided by the course instructors.
 
 
 
