@@ -56,3 +56,92 @@ Move Features:
 - STAB (Same Type Attack Bonus) indicator
 - Opponent's last move priority
 
+
+## Reward Function Design (CustomRewardFunction.java)
+The reward function uses a STATE_ACTION_STATE paradigm with carefully tuned components:
+HP-Based Rewards:
+
+Weight: 15.0× the change in HP differential between teams
+Computed as: 15.0 × ((myHpAfter - oppHpAfter) - (myHpBefore - oppHpBefore))
+Captures both damage dealt and damage taken
+
+KO Rewards:
+- +20.0 per opponent Pokemon fainted
+- -20.0 per own Pokemon fainted
+Encourages finishing off low-HP opponents
+
+Status Condition Rewards:
+- Curing own status: +3.0
+- Inflicting SLEEP/FREEZE on opponent: +6.0
+- Inflicting TOXIC on opponent: +5.0
+- Inflicting other status on opponent: +2.5
+- Receiving status has symmetric negative rewards
+- Prioritizes debilitating status effects
+
+Terminal State Rewards:
+- Win: +40.0
+- Loss: -40.0
+- Draw: 0.0
+
+Behavioral Penalties:
+Switching penalty: -2.0
+Encourages commitment and discourages excessive switching
+
+Bounds: All rewards are clamped to [-50.0, 50.0]
+
+## Pokemon Selection Strategy (PolicyAgent.java)
+When forced to switch (e.g., after a faint), the agent uses a heuristic-based selection:
+Scoring Components:
+
+HP ratio: 1.8× weight
+Speed (normalized): 0.4× weight
+Offensive potential vs opponent: 0.9× weight
+Defensive risk from opponent: -0.7× weight
+Speed advantage bonus: +0.2
+Status condition penalties (SLEEP/FREEZE: -0.9, PARALYSIS: -0.6, BURN: -0.5, POISON/TOXIC: -0.4)
+
+Offensive Potential Estimation:
+
+Evaluates type effectiveness multipliers
+Considers STAB bonus
+Factors in move power and accuracy
+Accounts for stat stages
+
+Defensive Risk Estimation:
+
+Estimates incoming damage based on type weaknesses/resistances
+Considers opponent's move power and accuracy
+Adjusts for current stat stages
+
+Double DQN Implementation
+The agent uses Double DQN to reduce Q-value overestimation:
+
+Main Network: Used for action selection and updated during training
+Target Network: Used for Q-value estimation in TD-targets, updated every 10,000 steps
+Bellman Update: Q(s,a) = reward + γ × max_a' Q_target(s', a')
+
+Batch Processing Optimizations:
+
+Batched forward passes for move evaluation (reduces computation)
+Efficient replay buffer sampling
+Fallback to individual processing on batch failures
+
+Training Monitoring
+
+Win rate logged every 100 games
+Epsilon value logged every 100,000 training steps
+Consecutive switch tracking to prevent degenerate policies
+
+## Key Design Decisions
+- Extensive Feature Engineering: 291 features capture nearly all relevant battle state information, including team composition, stat stages, status conditions, and move properties.
+- Shaped Rewards: Rather than sparse +1/-1 win/loss rewards, the reward function provides dense feedback on HP trades, KOs, and status conditions to accelerate learning.
+- Double DQN: Prevents Q-value overestimation that plagues vanilla DQN, leading to more stable training.
+- Heuristic Pokemon Selection: Instead of learning switching strategy from scratch (which is difficult with limited episodes), uses domain knowledge to make reasonable switch decisions.
+- Type Effectiveness Integration: Offensive/defensive estimations explicitly compute type matchup multipliers, incorporating core Pokemon battle mechanics.
+- Status Prioritization: Higher rewards for SLEEP/FREEZE (most debilitating) and TOXIC (escalating damage) reflect competitive Pokemon strategy.
+
+Usage
+This code is designed to work with the BU course framework and is provided for reference purposes.
+
+
+
