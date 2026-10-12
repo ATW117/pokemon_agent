@@ -89,7 +89,12 @@ public class Evaluate
 
         final java.io.PrintStream out = silenceStdout();
         final Namespace ns = makeNamespace(modelFile);
-        ExecutorService pool = Executors.newFixedThreadPool(numThreads);
+        // daemon workers: if a game throws, main reports it and the JVM exits instead of hanging on idle workers
+        ExecutorService pool = Executors.newFixedThreadPool(numThreads, r -> {
+            Thread t = new Thread(r);
+            t.setDaemon(true);
+            return t;
+        });
 
         for (int o = 6; o < args.length; o++) {
             final String oppClass = args[o];

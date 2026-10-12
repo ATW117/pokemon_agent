@@ -43,6 +43,24 @@ All numbers are win rates on 3,000 fresh games per opponent with random teams. T
 - In the transition model (`getPotentialEffects`), multi-hit moves expanded exponentially and Metronome → Mirror Move → Metronome recursed without bound. Drac5290Agent runs out of memory or never finishes because of this. The patch merges identical outcomes and adds a recursion guard.
 - These fixes live in `patches/pokePA-patches.jar`, which is placed before `lib/*` on the classpath. Both are built from decompiled course code, so they are not included in this repo.
 
+## Experiment: decision-time lookahead (`LookaheadAgent`)
+
+`LookaheadAgent` adds a one-turn search on top of the trained network:
+- It copies the battle and simulates every (my move, opponent reply) pair 4-8 times with the engine's own randomness.
+- It scores each result as the immediate reward plus the network's value of the position that follows.
+- It models the opponent as a mix of "plays like our network would" and uniform random.
+
+It did **not** beat the plain greedy policy (1,000 games, same seeds):
+
+| Agent | vs Random | vs Aggro | vs Drac (teams of 1-3) |
+|---|---|---|---|
+| Greedy (`PolicyAgent`) | 80.1% | 73.4% | 63.8% |
+| Lookahead, mixed opponent | 77.7% | 69.8% | 65.8% |
+
+The Q-network was already trained against this opponent mix, so it has learned the expected reply. A one-turn search with an inexact opponent model mostly adds noise. Assuming the opponent mirrors our network drops the Aggro result to 61.6%, and assuming it plays at random brings it back to 72.3%.
+
+While building it, I found one more framework bug. `Team(TeamView)` never sets each Pokémon's team reference, so a `Battle` rebuilt from a view crashes when it applies a move, and its damage calculations ignore Reflect and Light Screen. This also affects Drac5290Agent's planning.
+
 ## Running
 
 You need the course framework jars in `lib/` (not included). Run everything from the repo root.

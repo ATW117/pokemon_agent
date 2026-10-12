@@ -202,19 +202,9 @@ public class PolicyAgent
     @Override
     public MoveView getMove(BattleView view)
     {
-        List<MoveView> moves = this.legalMoves(view);
+        List<MoveView> moves = this.candidateMoves(view);
         if (moves.isEmpty()) {
             return null;
-        }
-        // a greedy policy can ping-pong between two switches forever; after a few in a row, force an attack
-        if (this.consecutiveSwitches >= MAX_CONSECUTIVE_SWITCHES) {
-            List<MoveView> attacks = new ArrayList<>();
-            for (MoveView m : moves) {
-                if (!(m instanceof SwitchMove.SwitchMoveView)) attacks.add(m);
-            }
-            if (!attacks.isEmpty()) {
-                moves = attacks;
-            }
         }
         if (this.isTraining && this.epsilonOverride == null) {
             GLOBAL_STEPS.incrementAndGet();
@@ -226,8 +216,39 @@ public class PolicyAgent
         } else {
             chosen = this.argmaxOver(view, moves);
         }
-        this.consecutiveSwitches = (chosen instanceof SwitchMove.SwitchMoveView) ? this.consecutiveSwitches + 1 : 0;
+        this.recordChoice(chosen);
         return chosen;
+    }
+
+    /** Legal moves after the anti-ping-pong guard: after a few switches in a row, only attacks are allowed. */
+    protected List<MoveView> candidateMoves(BattleView view)
+    {
+        List<MoveView> moves = this.legalMoves(view);
+        if (this.consecutiveSwitches >= MAX_CONSECUTIVE_SWITCHES) {
+            List<MoveView> attacks = new ArrayList<>();
+            for (MoveView m : moves) {
+                if (!(m instanceof SwitchMove.SwitchMoveView)) attacks.add(m);
+            }
+            if (!attacks.isEmpty()) {
+                moves = attacks;
+            }
+        }
+        return moves;
+    }
+
+    protected void recordChoice(MoveView chosen)
+    {
+        this.consecutiveSwitches = (chosen instanceof SwitchMove.SwitchMoveView) ? this.consecutiveSwitches + 1 : 0;
+    }
+
+    protected void setScorer(QScorer scorer)
+    {
+        this.scorer = scorer;
+    }
+
+    protected QScorer getScorer()
+    {
+        return this.scorer;
     }
 
     @Override
@@ -263,9 +284,14 @@ public class PolicyAgent
 
     public double[][] encodeAll(BattleView view, List<MoveView> moves)
     {
+        return this.encodeAllFor(view, moves, this.getMyTeamIdx() == 1 ? 1 : 0);
+    }
+
+    /** Encodes (view, move) pairs as seen by team `me`, e.g. to model the opponent with our own network. */
+    public double[][] encodeAllFor(BattleView view, List<MoveView> moves, int me)
+    {
         this.ensureReady();
         CustomSensorArray sensors = (CustomSensorArray) this.getSensorArray();
-        int me = this.getMyTeamIdx() == 1 ? 1 : 0;
         double[][] feats = new double[moves.size()][];
         for (int i = 0; i < moves.size(); i++) {
             feats[i] = sensors.encode(view, moves.get(i), me);
@@ -311,7 +337,12 @@ public class PolicyAgent
     @Override
     public Integer chooseNextPokemon(BattleView view)
     {
-        int me = this.getMyTeamIdx() == 1 ? 1 : 0;
+        return chooseReplacement(view, this.getMyTeamIdx() == 1 ? 1 : 0);
+    }
+
+    /** Heuristic replacement after a faint for team `me`: HP, damage race vs the opposing active, speed, status. */
+    public static Integer chooseReplacement(BattleView view, int me)
+    {
         TeamView myTeam = view.getTeamView(me);
         TeamView oppTeam = view.getTeamView(1 - me);
         PokemonView opp = oppTeam.getActivePokemonView();
