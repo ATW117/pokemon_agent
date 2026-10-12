@@ -1,0 +1,10 @@
+# course framework and materials (not redistributable)
+lib/
+handout/
+patches/
+# build output, training runs, local logs
+build/
+build_*/
+runs/
+logs/
+*.class

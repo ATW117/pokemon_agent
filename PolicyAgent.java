@@ -5,408 +5,136 @@ package src.pas.pokemon.agents;
 import net.sourceforge.argparse4j.inf.Namespace;
 
 import edu.bu.pas.pokemon.agents.NeuralQAgent;
-import edu.bu.pas.pokemon.agents.senses.SensorArray;
 import edu.bu.pas.pokemon.agents.rewards.RewardFunction;
 import edu.bu.pas.pokemon.core.Battle.BattleView;
 import edu.bu.pas.pokemon.core.Move.MoveView;
-import edu.bu.pas.pokemon.linalg.Matrix;
-import edu.bu.pas.pokemon.nn.Model;
-import edu.bu.pas.pokemon.nn.models.Sequential;
-import edu.bu.pas.pokemon.nn.layers.Dense; // fully connected layer
-import edu.bu.pas.pokemon.nn.layers.ReLU;  // some activations (below too)
-import edu.bu.pas.pokemon.nn.layers.Tanh;
-import edu.bu.pas.pokemon.nn.layers.Sigmoid;
-import edu.bu.pas.pokemon.nn.Parameter;
-import edu.bu.pas.pokemon.core.Move;
 import edu.bu.pas.pokemon.core.SwitchMove;
-import edu.bu.pas.pokemon.training.data.ReplayBuffer;
 import edu.bu.pas.pokemon.core.Team.TeamView;
 import edu.bu.pas.pokemon.core.Pokemon.PokemonView;
-import edu.bu.pas.pokemon.core.enums.Stat;
+import edu.bu.pas.pokemon.core.enums.Flag;
 import edu.bu.pas.pokemon.core.enums.NonVolatileStatus;
-import edu.bu.pas.pokemon.core.enums.Type;
-import java.util.Random;
-import java.util.List;
+import edu.bu.pas.pokemon.core.enums.Stat;
+import edu.bu.pas.pokemon.linalg.Matrix;
+import edu.bu.pas.pokemon.nn.Model;
+import edu.bu.pas.pokemon.nn.Parameter;
+import edu.bu.pas.pokemon.nn.layers.Dense;
+import edu.bu.pas.pokemon.nn.layers.ReLU;
+import edu.bu.pas.pokemon.nn.models.Sequential;
+import edu.bu.pas.pokemon.training.data.ReplayBuffer;
+
 import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.concurrent.atomic.AtomicLong;
 
 // JAVA PROJECT IMPORTS
+import src.pas.pokemon.rewards.CustomRewardFunction;
 import src.pas.pokemon.senses.CustomSensorArray;
 
 
+/**
+ * Q(s, a) agent. Training and evaluation choose from the same legal action set (attacks + switches);
+ * the only difference is epsilon-greedy exploration during training.
+ *
+ * Two training paths are supported:
+ *   - the course's ParallelTrain/Train (uses makeGroundTruth below, Double DQN with a target network)
+ *   - src.pas.pokemon.train.DQNTrainer (own loop, injects a fast scorer and sets epsilon directly)
+ */
 public class PolicyAgent
     extends NeuralQAgent
 {
-    private static final int EPSILON_LOG_INTERVAL = 100000;
+    public static final int HIDDEN1 = 512;
+    public static final int HIDDEN2 = 256;
 
-    private Random random;
-    private double epsilonStart;
-    private double epsilonEnd;
-    private int epsilonDecaySteps;
-    private boolean isTraining; 
-    
-    private Model targetNetwork;
-    private int targetUpdateFrequency;
-    private int nextTargetUpdateStep;
-    private int gamesPlayed = 0;
-    private int gamesWon = 0;
-    private static int globalTrainingStepCount = 0;
-    
-    private int consecutiveSwitchChoices = 0;
-    
+    /** Lets the trainer plug in a faster network implementation; rows of feats are (state, action) encodings. */
+    public interface QScorer
+    {
+        double[] score(double[][] feats);
+    }
+
+    // epsilon schedule for the framework training path (shared by all instances in the JVM)
+    private static final AtomicLong GLOBAL_STEPS = new AtomicLong();
+    private static final double EPS_START = Double.parseDouble(System.getProperty("pokemon.eps.start", "1.0"));
+    private static final double EPS_END = Double.parseDouble(System.getProperty("pokemon.eps.end", "0.05"));
+    private static final long EPS_DECAY = Long.parseLong(System.getProperty("pokemon.eps.decay", "2000000"));
+
+    private final Random random = new Random();
+    private boolean isTraining = false;
+    private Double epsilonOverride = null;
+    private QScorer scorer = null;
+    private Model targetNetwork = null;
+    private int consecutiveSwitches = 0;
+
     public PolicyAgent()
     {
         super();
-        this.random = new Random();
-        this.epsilonStart = 1.0;
-        this.epsilonEnd = 0.1;
-        this.epsilonDecaySteps = 10000000;
-        this.isTraining = false; 
-        this.targetNetwork = null;
-        this.targetUpdateFrequency = 10000; 
-        this.nextTargetUpdateStep = this.targetUpdateFrequency;
-        
     }
-    
-    private double getCurrentEpsilon() {
-        double progress = Math.min(1.0, (double)globalTrainingStepCount / epsilonDecaySteps);
-    double epsilon = epsilonEnd + (epsilonStart - epsilonEnd) * (1.0 - progress);
-    return epsilon;
-    }
+
+    // ------------------------------------------------------------------ setup
 
     public void initializeSenses(Namespace args)
     {
-        SensorArray modelSenses = new CustomSensorArray();
-        this.setSensorArray(modelSenses);
+        this.setSensorArray(new CustomSensorArray(() -> this.getMyTeamIdx() == 1 ? 1 : 0));
     }
 
     @Override
     public void initialize(Namespace args)
     {
-        // make sure you call this, this will call your initModel() and set a field
-        // AND if the command line argument "inFile" is present will attempt to set
-        // your model with the contents of that file.
+        // builds the model via initModel() and loads params when --inFile is given
         super.initialize(args);
-
-        if (this.getModel() == null) {
-            Model model = this.initModel();
-            this.setModel(model);
-        }
         this.initializeSenses(args);
-
-        if (this.targetNetwork == null) {
-            this.targetNetwork = this.initModel();
-        }
-        this.updateTargetNetwork(); 
-        
-    }
-
-    private void updateTargetNetwork() {
-        if (targetNetwork == null || this.getModel() == null) {
-            return;
-        }
-        
-        try {
-            List<Parameter> mainParams = this.getModel().getParameters();
-            List<Parameter> targetParams = targetNetwork.getParameters();
-            
-            if (mainParams.size() != targetParams.size()) {
-                System.err.println("Warning: Parameter count mismatch in target network update");
-                return;
-            }
-            
-            for (int i = 0; i < mainParams.size(); i++) {
-                Matrix mainValue = mainParams.get(i).getValue();
-                Matrix targetValue = targetParams.get(i).getValue();
-                
-                int numRows = mainValue.getShape().getNumRows();
-                int numCols = mainValue.getShape().getNumCols();
-                targetValue.copySlice(0, numRows, 0, numCols, mainValue);
-            }
-        } catch (Exception e) {
-            System.err.println("Error updating target network: " + e.getMessage());
-            e.printStackTrace();
-        }
     }
 
     @Override
     public Model initModel()
     {
-        final int N_INPUT = 291;
-        Sequential qFunction = new Sequential();
-        qFunction.add(new Dense(N_INPUT, 128));
-        qFunction.add(new ReLU());
-        qFunction.add(new Dense(128, 128));
-        qFunction.add(new ReLU());
-        qFunction.add(new Dense(128, 1));
-        return qFunction;
+        Sequential q = new Sequential();
+        q.add(new Dense(CustomSensorArray.NUM_FEATURES, HIDDEN1));
+        q.add(new ReLU());
+        q.add(new Dense(HIDDEN1, HIDDEN2));
+        q.add(new ReLU());
+        q.add(new Dense(HIDDEN2, 1));
+        heInit(q, new Random());
+        return q;
     }
 
-    @Override
-    public Integer chooseNextPokemon(BattleView view)
+    /** Matrix.randn gives std=1 weights, which saturates a 300-input network; rescale to He init with zero bias. */
+    public static void heInit(Model model, Random rng)
     {
-        TeamView myTeam = this.getMyTeamView(view);
-        TeamView oppTeam = this.getOpponentTeamView(view);
-        PokemonView oppActive = (oppTeam == null) ? null : oppTeam.getActivePokemonView();
-        Integer bestIdx = null;
-        Double bestScore = Double.NEGATIVE_INFINITY;
-
-
-        for (int i = 0; i < myTeam.size(); i++){
-            PokemonView myPokemon = myTeam.getPokemonView(i);
-            if (myPokemon.hasFainted()){
-                continue;
-            }
-
-            double score = 0.0;
-            double hpFrac = (double) myPokemon.getCurrentStat(Stat.HP) / Math.max(1.0, (double) myPokemon.getInitialStat(Stat.HP));
-
-            score += 1.8 * hpFrac;
-            score += 0.4 * getNormalizedStat(myPokemon, Stat.SPD);
-
-            if (oppActive != null) {
-                double offensiveOutlook = estimateOffensivePotential(myPokemon, oppActive);
-                double defensiveRisk = estimateDefensiveRisk(myPokemon, oppActive);
-                score += 0.9 * offensiveOutlook;
-                score -= 0.7 * defensiveRisk;
-
-                if (myPokemon.getCurrentStat(Stat.SPD) > oppActive.getCurrentStat(Stat.SPD)) {
-                    score += 0.2;
+        List<Parameter> params = model.getParameters();
+        for (int p = 0; p + 1 < params.size(); p += 2) {
+            Matrix W = params.get(p).getValue();
+            Matrix b = params.get(p + 1).getValue();
+            int fanIn = W.getShape().getNumRows();
+            double std = Math.sqrt(2.0 / fanIn);
+            for (int i = 0; i < fanIn; i++) {
+                for (int j = 0; j < W.getShape().getNumCols(); j++) {
+                    W.set(i, j, rng.nextGaussian() * std);
                 }
             }
-
-            score -= statusPenalty(myPokemon.getNonVolatileStatus());
-
-            if (score > bestScore){
-                bestScore = score;
-                bestIdx = i;
-            }
-
-    }
-
-    return bestIdx;
-    }
-
-    private double statusPenalty(NonVolatileStatus status) {
-        if (status == null || status == NonVolatileStatus.NONE) {
-            return 0.0;
-        }
-        switch (status) {
-            case SLEEP:
-            case FREEZE:
-                return 0.9;
-            case PARALYSIS:
-                return 0.6;
-            case BURN:
-                return 0.5;
-            case POISON:
-            case TOXIC:
-                return 0.4;
-            default:
-                return 0.3;
-        }
-    }
-
-    private double estimateOffensivePotential(PokemonView attacker, PokemonView defender) {
-        if (attacker == null || defender == null) {
-            return 0.0;
-        }
-
-        List<MoveView> moves = attacker.getAvailableMoves();
-        if (moves == null || moves.isEmpty()) {
-            return 0.0;
-        }
-
-        double bestScore = 0.0;
-        for (MoveView move : moves) {
-            if (move == null || move.getType() == null) {
-                continue;
-            }
-            double typeMultiplier = computeTypeMultiplier(move.getType(), defender);
-            double stabBonus = isStab(move.getType(), attacker) ? 0.2 : 0.0;
-            double powerFactor = normalizePower(move.getPower());
-            double moveScore = typeMultiplier * (0.5 + powerFactor) + stabBonus;
-            bestScore = Math.max(bestScore, moveScore);
-        }
-        return clamp(bestScore, 0.0, 2.5);
-    }
-
-    private double estimateDefensiveRisk(PokemonView candidate, PokemonView opponent) {
-        if (candidate == null || opponent == null) {
-            return 0.0;
-        }
-
-        List<MoveView> moves = opponent.getAvailableMoves();
-        if (moves == null || moves.isEmpty()) {
-            return 0.0;
-        }
-
-        double worstThreat = 0.0;
-        for (MoveView move : moves) {
-            if (move == null || move.getType() == null) {
-                continue;
-            }
-            double typeMultiplier = computeTypeMultiplier(move.getType(), candidate);
-            double powFactor = 0.5 + normalizePower(move.getPower());
-            worstThreat = Math.max(worstThreat, typeMultiplier * powFactor);
-        }
-        return clamp(worstThreat, 0.0, 3.0);
-    }
-
-    private boolean isStab(Type moveType, PokemonView pokemon) {
-        if (moveType == null || pokemon == null) {
-            return false;
-        }
-        return moveType == pokemon.getCurrentType1() || moveType == pokemon.getCurrentType2();
-    }
-
-    private double computeTypeMultiplier(Type attackingType, PokemonView defender) {
-        if (attackingType == null || defender == null) {
-            return 1.0;
-        }
-        double multiplier = 1.0;
-        Type defType1 = defender.getCurrentType1();
-        Type defType2 = defender.getCurrentType2();
-
-        if (defType1 != null) {
-            multiplier *= Type.getEffectivenessModifier(attackingType, defType1);
-        }
-        if (defType2 != null && defType2 != defType1) {
-            multiplier *= Type.getEffectivenessModifier(attackingType, defType2);
-        }
-        return multiplier;
-    }
-
-    private double normalizePower(Integer power) {
-        if (power == null) {
-            return 0.3;
-        }
-        return clamp(power / 120.0, 0.0, 1.0);
-    }
-
-    private double getNormalizedStat(PokemonView pokemon, Stat stat) {
-        if (pokemon == null || stat == null) {
-            return 0.0;
-        }
-        double base = Math.max(1.0, (double) pokemon.getInitialStat(stat));
-        return clamp(pokemon.getCurrentStat(stat) / base, 0.0, 1.5);
-    }
-
-    private double clamp(double value, double min, double max) {
-        return Math.max(min, Math.min(max, value));
-    }
-    
-    private List<MoveView> getAllLegalMoves(BattleView view) {
-        TeamView myTeam = this.getMyTeamView(view);
-        if (myTeam == null) {
-            return new ArrayList<>();
-        }
-        
-        PokemonView active = myTeam.getActivePokemonView();
-        if (active == null) {
-            return new ArrayList<>();
-        }
-        
-        List<MoveView> legalMoves = new ArrayList<>(active.getAvailableMoves());
-        
-        int activeIdx = myTeam.getActivePokemonIdx();
-        for (int i = 0; i < myTeam.size(); i++) {
-            if (i != activeIdx) {
-                PokemonView pokemon = myTeam.getPokemonView(i);
-                if (pokemon != null && !pokemon.hasFainted()) {
-                    SwitchMove switchMove = new SwitchMove(i);
-                    legalMoves.add(switchMove.getView());
-                }
+            for (int j = 0; j < b.getShape().getNumCols(); j++) {
+                b.set(0, j, 0.0);
             }
         }
-        
-        return legalMoves;
     }
-    
-    @Override
-    public MoveView getMove(BattleView view)
+
+    /** Share another agent's network (trainer gives each worker its own agent but one set of weights). */
+    public void useModel(Model model, QScorer scorer)
     {
+        this.setModel(model);
+        this.scorer = scorer;
         if (this.getSensorArray() == null) {
             this.initializeSenses(null);
         }
-        if (this.getModel() == null) {
-            try {
-                Model model = this.initModel();
-                this.setModel(model);
-                if (this.targetNetwork == null) {
-                    this.targetNetwork = this.initModel();
-                    this.updateTargetNetwork();
-                }
-            } catch (Exception e) {
-                System.err.println("Error initializing model in getMove: " + e.getMessage());
-                TeamView myTeam = this.getMyTeamView(view);
-                if (myTeam != null) {
-                    PokemonView active = myTeam.getActivePokemonView();
-                    if (active != null) {
-                        List<MoveView> moves = active.getAvailableMoves();
-                        if (moves != null && !moves.isEmpty()) {
-                            return moves.get(0);
-                        }
-                    }
-                }
-                return null;
-            }
-        }
-        
-        if (isTraining) {
-            globalTrainingStepCount++;
-            logEpsilonIfNeeded();
-        }
-        
-        TeamView myTeam = this.getMyTeamView(view);
-        PokemonView active = (myTeam != null) ? myTeam.getActivePokemonView() : null;
-        List<MoveView> attackMoves = (active != null) ? active.getAvailableMoves() : new ArrayList<>();
-        
-        // During eval: only consider attacks (faster + no stalling)
-        if (!isTraining && attackMoves != null && !attackMoves.isEmpty()) {
-            return argmaxFromList(view, attackMoves);
-        }
-        
-        List<MoveView> legalMoves = getAllLegalMoves(view);
-        
-        if (consecutiveSwitchChoices >= 2 && attackMoves != null && !attackMoves.isEmpty()) {
-            List<MoveView> filteredMoves = new ArrayList<>();
-            for (MoveView move : legalMoves) {
-                if (attackMoves.contains(move)) {
-                    filteredMoves.add(move);
-                }
-            }
-            if (!filteredMoves.isEmpty()) {
-                legalMoves = filteredMoves;
-            }
-        }
-        
-        if (legalMoves == null || legalMoves.isEmpty()) {
-            return this.argmax(view);
-        }
-        
-        MoveView chosen;
-        if (isTraining) {
-            double epsilon = getCurrentEpsilon();
-            if (random.nextDouble() < epsilon) {
-                chosen = legalMoves.get(random.nextInt(legalMoves.size()));
-            } else {
-                chosen = argmaxFromList(view, legalMoves);
-            }
-        } else {
-            chosen = argmaxFromList(view, legalMoves);
-        }
-        
-        boolean isSwitch = (chosen != null && attackMoves != null && !attackMoves.contains(chosen));
-        if (isSwitch) {
-            consecutiveSwitchChoices++;
-        } else {
-            consecutiveSwitchChoices = 0;
-        }
-        
-        return chosen;
     }
-    
-    public void setTrainingMode(boolean training) {
+
+    public void setExplorationEpsilon(Double eps)
+    {
+        this.epsilonOverride = eps;
+    }
+
+    public void setTrainingMode(boolean training)
+    {
         this.isTraining = training;
     }
 
@@ -422,295 +150,275 @@ public class PolicyAgent
         this.setTrainingMode(false);
     }
 
+    private double currentEpsilon()
+    {
+        if (this.epsilonOverride != null) {
+            return this.epsilonOverride;
+        }
+        if (!this.isTraining) {
+            return 0.0;
+        }
+        double progress = Math.min(1.0, GLOBAL_STEPS.get() / (double) EPS_DECAY);
+        return EPS_END + (EPS_START - EPS_END) * (1.0 - progress);
+    }
+
+    // ------------------------------------------------------------------ acting
+
+    /** Legal actions for whoever this agent is in the given state. */
+    public List<MoveView> legalMoves(BattleView view)
+    {
+        return legalMovesFor(view, this.getMyTeamIdx() == 1 ? 1 : 0);
+    }
+
+    public static List<MoveView> legalMovesFor(BattleView view, int teamIdx)
+    {
+        List<MoveView> moves = new ArrayList<>();
+        if (view == null || view.isOver()) {
+            return moves;
+        }
+        TeamView team = view.getTeamView(teamIdx);
+        PokemonView active = team.getActivePokemonView();
+        if (active == null) {
+            return moves;
+        }
+        if (!active.hasFainted()) {
+            moves.addAll(active.getAvailableMoves());
+            // locked into a multi-turn move (the engine ignores whatever we submit) or trapped: no switching
+            if (active.getActiveMoveView() != null || active.getFlag(Flag.TRAPPED)) {
+                return moves;
+            }
+        }
+        for (int i = 0; i < team.size(); i++) {
+            PokemonView p = team.getPokemonView(i);
+            if (i != team.getActivePokemonIdx() && p != null && !p.hasFainted()) {
+                moves.add(new SwitchMove(i).getView());
+            }
+        }
+        return moves;
+    }
+
+    public static final int MAX_CONSECUTIVE_SWITCHES = 2;
+
+    @Override
+    public MoveView getMove(BattleView view)
+    {
+        List<MoveView> moves = this.legalMoves(view);
+        if (moves.isEmpty()) {
+            return null;
+        }
+        // a greedy policy can ping-pong between two switches forever; after a few in a row, force an attack
+        if (this.consecutiveSwitches >= MAX_CONSECUTIVE_SWITCHES) {
+            List<MoveView> attacks = new ArrayList<>();
+            for (MoveView m : moves) {
+                if (!(m instanceof SwitchMove.SwitchMoveView)) attacks.add(m);
+            }
+            if (!attacks.isEmpty()) {
+                moves = attacks;
+            }
+        }
+        if (this.isTraining && this.epsilonOverride == null) {
+            GLOBAL_STEPS.incrementAndGet();
+        }
+        MoveView chosen;
+        double eps = this.currentEpsilon();
+        if (eps > 0.0 && this.random.nextDouble() < eps) {
+            chosen = moves.get(this.random.nextInt(moves.size()));
+        } else {
+            chosen = this.argmaxOver(view, moves);
+        }
+        this.consecutiveSwitches = (chosen instanceof SwitchMove.SwitchMoveView) ? this.consecutiveSwitches + 1 : 0;
+        return chosen;
+    }
+
+    @Override
+    public MoveView argmax(BattleView view)
+    {
+        return this.argmaxOver(view, this.legalMoves(view));
+    }
+
+    /** Some framework entry points (e.g. RandomBattle) never call initialize(); build what we need lazily. */
+    private void ensureReady()
+    {
+        if (this.getSensorArray() == null) {
+            this.initializeSenses(null);
+        }
+        if (this.getModel() == null && this.scorer == null) {
+            this.setModel(this.initModel());
+        }
+    }
+
+    private MoveView argmaxOver(BattleView view, List<MoveView> moves)
+    {
+        if (moves.isEmpty()) {
+            return null;
+        }
+        this.ensureReady();
+        double[] q = this.qValues(this.getModel(), this.scorer, view, moves);
+        int best = 0;
+        for (int i = 1; i < q.length; i++) {
+            if (q[i] > q[best]) best = i;
+        }
+        return moves.get(best);
+    }
+
+    public double[][] encodeAll(BattleView view, List<MoveView> moves)
+    {
+        this.ensureReady();
+        CustomSensorArray sensors = (CustomSensorArray) this.getSensorArray();
+        int me = this.getMyTeamIdx() == 1 ? 1 : 0;
+        double[][] feats = new double[moves.size()][];
+        for (int i = 0; i < moves.size(); i++) {
+            feats[i] = sensors.encode(view, moves.get(i), me);
+        }
+        return feats;
+    }
+
+    /** Q-values for each move, batched into one forward pass. */
+    public double[] qValues(Model model, QScorer fast, BattleView view, List<MoveView> moves)
+    {
+        double[][] feats = this.encodeAll(view, moves);
+        if (fast != null) {
+            return fast.score(feats);
+        }
+        return forwardRows(model, feats);
+    }
+
+    public static double[] forwardRows(Model model, double[][] feats)
+    {
+        double[] out = new double[feats.length];
+        if (feats.length == 0) {
+            return out;
+        }
+        try {
+            Matrix X = Matrix.zeros(feats.length, feats[0].length);
+            for (int i = 0; i < feats.length; i++) {
+                for (int j = 0; j < feats[i].length; j++) {
+                    X.set(i, j, feats[i][j]);
+                }
+            }
+            Matrix Y = model.forward(X);
+            for (int i = 0; i < feats.length; i++) {
+                out[i] = Y.get(i, 0);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("PolicyAgent: forward pass failed", e);
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------------------ replacement after a faint
+
+    @Override
+    public Integer chooseNextPokemon(BattleView view)
+    {
+        int me = this.getMyTeamIdx() == 1 ? 1 : 0;
+        TeamView myTeam = view.getTeamView(me);
+        TeamView oppTeam = view.getTeamView(1 - me);
+        PokemonView opp = oppTeam.getActivePokemonView();
+
+        Integer bestIdx = null;
+        double bestScore = Double.NEGATIVE_INFINITY;
+        for (int i = 0; i < myTeam.size(); i++) {
+            PokemonView p = myTeam.getPokemonView(i);
+            if (p == null || p.hasFainted()) {
+                continue;
+            }
+            double hp = p.getCurrentStat(Stat.HP) / (double) Math.max(1, p.getInitialStat(Stat.HP));
+            double score = 0.8 * hp;
+            if (opp != null && !opp.hasFainted()) {
+                double dealt = Math.min(1.5, CustomSensorArray.bestDamageFrac(p, opp, oppTeam));
+                double taken = Math.min(1.5, CustomSensorArray.bestDamageFrac(opp, p, myTeam));
+                boolean faster = CustomSensorArray.effectiveSpeed(p) > CustomSensorArray.effectiveSpeed(opp);
+                score += dealt - taken;
+                // outspeeding and KOing first is decisive
+                if (faster && dealt >= 1.0) score += 0.75;
+                if (!faster && taken >= 1.0) score -= 0.75;
+            }
+            score -= statusPenalty(p.getNonVolatileStatus());
+            if (score > bestScore) {
+                bestScore = score;
+                bestIdx = i;
+            }
+        }
+        return bestIdx;
+    }
+
+    private static double statusPenalty(NonVolatileStatus status)
+    {
+        if (status == null) return 0.0;
+        switch (status) {
+            case SLEEP:
+            case FREEZE:
+                return 0.5;
+            case PARALYSIS:
+                return 0.3;
+            case TOXIC:
+                return 0.25;
+            case BURN:
+            case POISON:
+                return 0.15;
+            default:
+                return 0.0;
+        }
+    }
+
+    // ------------------------------------------------------------------ framework training path
+
+    /**
+     * Double DQN ground truth for the course's Train/ParallelTrain:
+     *   y = r + gamma * Q_target(s', argmax_a' Q_online(s', a'))
+     * Rewards are computed from this agent's perspective. Note that the framework's TrainingBattleDriver
+     * pairs each action with the following turn's transition; prefer DQNTrainer, which records (s, a, s')
+     * correctly.
+     */
     @Override
     public Matrix makeGroundTruth(ReplayBuffer buffer, double discountFactor, RewardFunction rewardFunction)
     {
-        if (globalTrainingStepCount >= nextTargetUpdateStep) {
-            System.err.println(String.format(
-                "[TARGET_UPDATE] Steps=%d. Updating target network.", 
-                globalTrainingStepCount
-            ));
-            
-            updateTargetNetwork();
-            nextTargetUpdateStep = globalTrainingStepCount + targetUpdateFrequency;
+        if (this.targetNetwork == null) {
+            this.targetNetwork = this.initModel();
         }
-        
-        Matrix ygroundTruth = Matrix.zeros(buffer.size(), 1);
-        Model networkToUse = (targetNetwork != null) ? targetNetwork : this.getModel();
-        
-        final int GROUND_TRUTH_BATCH_SIZE = 256; 
-
-        List<Integer> stateIndices = new ArrayList<>(GROUND_TRUTH_BATCH_SIZE);
-        List<Matrix> allInputs = new ArrayList<>();
-        List<Integer> moveCountsPerState = new ArrayList<>(GROUND_TRUTH_BATCH_SIZE);
-
-        for (int rIdx = 0; rIdx < buffer.size(); rIdx++){
-            BattleView state = buffer.getState(rIdx);
-            MoveView action = buffer.getAction(rIdx);
-            BattleView nextState = buffer.getNextState(rIdx);
-            
-            double reward = rewardFunction.getStateActionStateReward(state, action, nextState);
-            
-            if (nextState == null || nextState.isOver()){
-                ygroundTruth.set(rIdx, 0, reward);
-                continue;
-            }
-
-            List<MoveView> legalMoves = getAllLegalMoves(nextState);
-                
-            if (legalMoves.isEmpty()) {
-                ygroundTruth.set(rIdx, 0, reward);
-                continue;
-            }
-                
-            List<Matrix> currentMoveInputs = new ArrayList<>(legalMoves.size());
-            for (MoveView move : legalMoves) {
-                try {
-                    Matrix input = this.getModelInput(nextState, move);
-                    currentMoveInputs.add(input);
-                } catch (Exception e) {
+        // the framework calls this once per cycle, so the target is the network as of the start of the cycle
+        copyParams(this.getModel(), this.targetNetwork);
+        int me = this.getMyTeamIdx() == 1 ? 1 : 0;
+        Matrix y = Matrix.zeros(buffer.size(), 1);
+        for (int i = 0; i < buffer.size(); i++) {
+            BattleView s = buffer.getState(i);
+            MoveView a = buffer.getAction(i);
+            BattleView s2 = buffer.getNextState(i);
+            double target = CustomRewardFunction.reward(s, a, s2, me);
+            List<MoveView> next = this.legalMoves(s2);
+            if (s2 != null && !s2.isOver() && !next.isEmpty()) {
+                double[][] feats = this.encodeAll(s2, next);
+                double[] qOnline = forwardRows(this.getModel(), feats);
+                int best = 0;
+                for (int k = 1; k < qOnline.length; k++) {
+                    if (qOnline[k] > qOnline[best]) best = k;
                 }
+                double[] qTarget = forwardRows(this.targetNetwork, new double[][] {feats[best]});
+                target += discountFactor * qTarget[0];
             }
-
-            if (!currentMoveInputs.isEmpty()) {
-                stateIndices.add(rIdx);
-                allInputs.addAll(currentMoveInputs);
-                moveCountsPerState.add(currentMoveInputs.size());
-            } else {
-                ygroundTruth.set(rIdx, 0, reward);
-            }
-            
-            boolean isLastSample = (rIdx == buffer.size() - 1);
-            if ((stateIndices.size() >= GROUND_TRUTH_BATCH_SIZE || (isLastSample && !stateIndices.isEmpty()))) {
-                processGroundTruthBatch(
-                    ygroundTruth, buffer, rewardFunction, discountFactor, networkToUse,
-                    stateIndices, allInputs, moveCountsPerState
-                );
-                stateIndices.clear();
-                allInputs.clear();
-                moveCountsPerState.clear();
-            }
+            y.set(i, 0, target);
         }
-        return ygroundTruth;
+        return y;
     }
 
-    private void processGroundTruthBatch(Matrix ygroundTruth, ReplayBuffer buffer, RewardFunction rewardFunction,
-                                         double discountFactor, Model networkToUse, List<Integer> stateIndices,
-                                         List<Matrix> allInputs, List<Integer> moveCountsPerState)
+    public static void copyParams(Model from, Model to)
     {
+        List<Parameter> src = from.getParameters();
+        List<Parameter> dst = to.getParameters();
         try {
-            int totalMoves = allInputs.size();
-            int numCols = allInputs.get(0).getShape().getNumCols();
-            Matrix batchedInput = Matrix.zeros(totalMoves, numCols);
-            
-            for (int i = 0; i < totalMoves; i++) {
-                batchedInput.copySlice(i, i + 1, 0, numCols, allInputs.get(i));
+            for (int i = 0; i < src.size(); i++) {
+                Matrix s = src.get(i).getValue();
+                dst.get(i).getValue().copySlice(0, s.getShape().getNumRows(), 0, s.getShape().getNumCols(), s);
             }
-
-            Matrix batchedOutput = networkToUse.forward(batchedInput);
-
-            int outputIdx = 0;
-            for (int i = 0; i < stateIndices.size(); i++) {
-                int rIdx = stateIndices.get(i);
-                int numMoves = moveCountsPerState.get(i);
-                
-                Double maxQValue = null;
-                for (int m = 0; m < numMoves; m++) {
-                    double qVal = batchedOutput.get(outputIdx, 0);
-                    if (maxQValue == null || qVal > maxQValue) {
-                        maxQValue = qVal;
-                    }
-                    outputIdx++;
-                }
-                
-                BattleView state = buffer.getState(rIdx);
-                MoveView action = buffer.getAction(rIdx);
-                BattleView nextState = buffer.getNextState(rIdx);
-                double reward = rewardFunction.getStateActionStateReward(state, action, nextState);
-                
-                if (maxQValue != null) {
-                    ygroundTruth.set(rIdx, 0, reward + discountFactor * maxQValue);
-                } else {
-                    ygroundTruth.set(rIdx, 0, reward);
-                }
-            }
-
         } catch (Exception e) {
-            System.err.println("Warning: Ground truth batch processing failed, falling back to individual. " + e.getMessage());
-            processGroundTruthIndividually(
-                ygroundTruth, buffer, rewardFunction, discountFactor, networkToUse, stateIndices
-            );
+            throw new RuntimeException("PolicyAgent: parameter copy failed", e);
         }
-    }
-
-    private void processGroundTruthIndividually(Matrix ygroundTruth, ReplayBuffer buffer, RewardFunction rewardFunction,
-                                                double discountFactor, Model networkToUse, List<Integer> stateIndices)
-    {
-        for (int rIdx : stateIndices) {
-            BattleView state = buffer.getState(rIdx);
-            MoveView action = buffer.getAction(rIdx);
-            BattleView nextState = buffer.getNextState(rIdx);
-            double reward = rewardFunction.getStateActionStateReward(state, action, nextState);
-            
-            List<MoveView> legalMoves = getAllLegalMoves(nextState);
-            if (legalMoves.isEmpty()) {
-                ygroundTruth.set(rIdx, 0, reward);
-                continue;
-            }
-
-            Double maxQValue = null;
-            for (MoveView move : legalMoves) {
-                try {
-                    Matrix input = this.getModelInput(nextState, move);
-                    Matrix output = networkToUse.forward(input);
-                    double qVal = output.get(0, 0);
-                    if (maxQValue == null || qVal > maxQValue) {
-                        maxQValue = qVal;
-                    }
-                } catch (Exception e) {
-                }
-            }
-            
-            if (maxQValue != null) {
-                ygroundTruth.set(rIdx, 0, reward + discountFactor * maxQValue);
-            } else {
-                ygroundTruth.set(rIdx, 0, reward);
-            }
-        }
-    }
-
-    private MoveView argmaxFromList(BattleView view, List<MoveView> moves)
-    {
-        if (moves == null || moves.isEmpty()) {
-            return null;
-        }
-        
-        if (this.getSensorArray() == null) {
-            this.initializeSenses(null);
-        }
-        if (this.getModel() == null) {
-            try {
-                Model model = this.initModel();
-                this.setModel(model);
-                if (this.targetNetwork == null) {
-                    this.targetNetwork = this.initModel();
-                    this.updateTargetNetwork();
-                }
-            } catch (Exception e) {
-                System.err.println("Error initializing model in argmaxFromList: " + e.getMessage());
-                return moves.get(0);
-            }
-        }
-        
-        try {
-            int numMoves = moves.size();
-            List<Matrix> inputs = new ArrayList<>(numMoves);
-            
-            for (MoveView move : moves) {
-                Matrix input = this.getModelInput(view, move);
-                inputs.add(input);
-            }
-            
-            int numCols = inputs.get(0).getShape().getNumCols();
-            Matrix batchedInput = Matrix.zeros(numMoves, numCols);
-            for (int i = 0; i < numMoves; i++) {
-                batchedInput.copySlice(i, i + 1, 0, numCols, inputs.get(i));
-            }
-            
-            Matrix batchedOutput = this.getModel().forward(batchedInput);
-            
-            Double maxVal = null;
-            MoveView bestMove = null;
-            for (int i = 0; i < numMoves; i++) {
-                double qVal = batchedOutput.get(i, 0);
-                if (maxVal == null || qVal > maxVal) {
-                    maxVal = qVal;
-                    bestMove = moves.get(i);
-                }
-            }
-            
-            return (bestMove != null) ? bestMove : moves.get(0);
-            
-        } catch (Exception e) {
-            System.err.println("Warning: Batch inference failed in argmaxFromList, using first move: " + e.getMessage());
-            return moves.get(0);
-        }
-    }
-
-    @Override
-    public Move.MoveView argmax(BattleView view)
-    {
-        if (this.getSensorArray() == null) {
-            this.initializeSenses(null);
-        }
-        if (this.getModel() == null) {
-            try {
-                Model model = this.initModel();
-                this.setModel(model);
-                if (this.targetNetwork == null) {
-                    this.targetNetwork = this.initModel();
-                    this.updateTargetNetwork();
-                }
-            } catch (Exception e) {
-                System.err.println("Error initializing model in argmax: " + e.getMessage());
-                TeamView myTeam = this.getMyTeamView(view);
-                if (myTeam != null) {
-                    PokemonView active = myTeam.getActivePokemonView();
-                    if (active != null) {
-                        List<MoveView> moves = active.getAvailableMoves();
-                        if (moves != null && !moves.isEmpty()) {
-                            return moves.get(0);
-                        }
-                    }
-                }
-                return null;
-            }
-        }
-        
-        List<MoveView> legalMoves = getAllLegalMoves(view);
-        return argmaxFromList(view, legalMoves);
     }
 
     @Override
     public void afterGameEnds(BattleView view)
     {
-        gamesPlayed++;
-    
-        TeamView myTeam = this.getMyTeamView(view);
-        TeamView oppTeam = this.getOpponentTeamView(view);
-        
-        int myFainted = 0;
-        int oppFainted = 0;
-        
-        for (int i = 0; i < myTeam.size(); i++) {
-            if (myTeam.getPokemonView(i).hasFainted()) myFainted++;
-        }
-        for (int i = 0; i < oppTeam.size(); i++) {
-            if (oppTeam.getPokemonView(i).hasFainted()) oppFainted++;
-        }
-        
-        if (oppFainted == oppTeam.size() && myFainted < myTeam.size()) {
-            gamesWon++;
-        }
-        
-        consecutiveSwitchChoices = 0;
-        
-        if (gamesPlayed % 100 == 0) {
-            double winRate = (double) gamesWon / gamesPlayed;
-            System.err.println(String.format("Games: %d | Win Rate: %.3f | Epsilon: %.3f", 
-                gamesPlayed, winRate, getCurrentEpsilon()));
-        }
-    }
-
-    private void logEpsilonIfNeeded() {
-        if (!isTraining) {
-            return;
-        }
-        if (globalTrainingStepCount % EPSILON_LOG_INTERVAL != 0) {
-            return;
-        }
-        double epsilon = getCurrentEpsilon();
-        System.err.println(String.format("[EPSILON] steps=%d epsilon=%.6f decaySteps=%d start=%.2f end=%.2f", 
-            globalTrainingStepCount, epsilon, epsilonDecaySteps, epsilonStart, epsilonEnd));
+        this.consecutiveSwitches = 0;
     }
 }

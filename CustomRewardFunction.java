@@ -10,13 +10,29 @@ import edu.bu.pas.pokemon.agents.rewards.RewardFunction.RewardType;
 import edu.bu.pas.pokemon.core.Battle.BattleView;
 import edu.bu.pas.pokemon.core.Move.MoveView;
 import edu.bu.pas.pokemon.core.Pokemon.PokemonView;
+import edu.bu.pas.pokemon.core.SwitchMove.SwitchMoveView;
 import edu.bu.pas.pokemon.core.Team.TeamView;
 import edu.bu.pas.pokemon.core.enums.Stat;
 import edu.bu.pas.pokemon.core.enums.NonVolatileStatus;
 
+/**
+ * Shaped reward on roughly a [-1, 1] scale per step so Q-targets stay small:
+ *   - change in (my team HP fraction - opponent team HP fraction)
+ *   - +/- KO_REWARD per faint
+ *   - per-pokemon status changes (compared slot by slot, so switching never looks like a cure)
+ *   - +/- 1 for winning/losing, -0.5 for a mutual KO
+ *   - a small penalty only for *voluntary* switches
+ * The perspective is the team index set by the framework/trainer via setTeamIdx (defaults to team 0).
+ */
 public class CustomRewardFunction
     extends RewardFunction
 {
+    public static final double HP_WEIGHT = 1.0;
+    public static final double KO_REWARD = 0.15;
+    public static final double WIN_REWARD = 1.0;
+    public static final double CURE_REWARD = 0.03;
+    public static final double SWITCH_PENALTY = 0.02;
+    public static final double DRAW_REWARD = -0.5;
 
     public CustomRewardFunction()
     {
@@ -25,12 +41,12 @@ public class CustomRewardFunction
 
     public double getLowerBound()
     {
-        return -50.0;
+        return -2.0;
     }
 
     public double getUpperBound()
     {
-        return 50.0;
+        return 2.0;
     }
 
     public double getStateReward(final BattleView state)
@@ -48,116 +64,117 @@ public class CustomRewardFunction
                                             final MoveView action,
                                             final BattleView nextState)
     {
-        TeamView myTeamBefore  = state.getTeam1View();
-        TeamView oppTeamBefore = state.getTeam2View();
-    
-        TeamView myTeamAfter   = nextState.getTeam1View();
-        TeamView oppTeamAfter  = nextState.getTeam2View();
-
-        PokemonView myActiveBefore = myTeamBefore.getActivePokemonView();
-        PokemonView oppActiveBefore = oppTeamBefore.getActivePokemonView();
-        PokemonView myActiveAfter = myTeamAfter.getActivePokemonView();
-        PokemonView oppActiveAfter = oppTeamAfter.getActivePokemonView();
-
-        NonVolatileStatus myStatusBefore = myActiveBefore.getNonVolatileStatus();
-        NonVolatileStatus oppStatusBefore = oppActiveBefore.getNonVolatileStatus();
-        NonVolatileStatus myStatusAfter = myActiveAfter.getNonVolatileStatus();
-        NonVolatileStatus oppStatusAfter = oppActiveAfter.getNonVolatileStatus();
-
-
-        double statusReward = 0.0;
-        if (myStatusBefore != NonVolatileStatus.NONE && myStatusAfter == NonVolatileStatus.NONE) {
-            statusReward += 3.0;
-        }
-        if (oppStatusBefore == NonVolatileStatus.NONE && oppStatusAfter != NonVolatileStatus.NONE) {
-            if (oppStatusAfter == NonVolatileStatus.SLEEP || oppStatusAfter == NonVolatileStatus.FREEZE) {
-                statusReward += 6.0;
-            } else if (oppStatusAfter == NonVolatileStatus.TOXIC) {
-                statusReward += 5.0;
-            } else {
-                statusReward += 2.5;
-            }
-        }
-        
-        if (myStatusBefore == NonVolatileStatus.NONE && myStatusAfter != NonVolatileStatus.NONE) {
-            if (myStatusAfter == NonVolatileStatus.SLEEP || myStatusAfter == NonVolatileStatus.FREEZE) {
-                statusReward -= 6.0;
-            } else if (myStatusAfter == NonVolatileStatus.TOXIC) {
-                statusReward -= 5.0;
-            } else {
-                statusReward -= 2.5;
-            }
-        }
-        
-    
-        double myHpBefore  = hpFrac(myTeamBefore);
-        double oppHpBefore = hpFrac(oppTeamBefore);
-        double myHpAfter   = hpFrac(myTeamAfter);
-        double oppHpAfter  = hpFrac(oppTeamAfter);
-    
-        double hpReward = 15.0 * ((myHpAfter - oppHpAfter) - (myHpBefore - oppHpBefore));
-    
-        int myFaintBefore  = faintedCount(myTeamBefore);
-        int oppFaintBefore = faintedCount(oppTeamBefore);
-        int myFaintAfter   = faintedCount(myTeamAfter);
-        int oppFaintAfter  = faintedCount(oppTeamAfter);
-    
-        int myFaintDelta  = myFaintAfter  - myFaintBefore;
-        int oppFaintDelta = oppFaintAfter - oppFaintBefore;
-    
-        double koReward = 0.0;
-        if (oppFaintDelta > 0) koReward += 20.0 * oppFaintDelta;
-        if (myFaintDelta  > 0) koReward -= 20.0 * myFaintDelta;
-    
-        double terminalReward = 0.0;
-        if (nextState.isOver()) {
-            boolean iLost  = (myFaintAfter  == myTeamAfter.size());
-            boolean oppLost = (oppFaintAfter == oppTeamAfter.size());
-        
-            if (iLost && !oppLost) {
-                terminalReward -= 40.0;
-            } else if (!iLost && oppLost) {
-                terminalReward += 40.0;
-            } else {
-                terminalReward += 0.0;
-            }
-        }
-        
-        double switchPenalty = 0.0;
-        if (myActiveBefore != null && myActiveAfter != null) {
-            int activeIdxBefore = myTeamBefore.getActivePokemonIdx();
-            int activeIdxAfter = myTeamAfter.getActivePokemonIdx();
-            if (activeIdxBefore != activeIdxAfter) {
-                switchPenalty = -2.0;
-            }
-        }
-    
-        double reward = hpReward + koReward + terminalReward + statusReward + switchPenalty;
-    
-        reward = Math.max(getLowerBound(), Math.min(getUpperBound(), reward));
-    
-        return reward;
+        return reward(state, action, nextState, this.getTeamIdx() == null ? 0 : this.getTeamIdx());
     }
 
-    private double hpFrac(TeamView team){
-            double cur = 0.0;
-            double max = 0.0;
-            for (int i = 0; i < team.size(); i++) {
-                PokemonView p = team.getPokemonView(i);
-                int initHp = p.getInitialStat(Stat.HP);
-                cur += p.getCurrentStat(Stat.HP);
-                max += initHp;
-            }
-            if (max <= 0) return 0.0;
-            return cur / max;
+    public static double reward(final BattleView state, final MoveView action, final BattleView nextState, final int me)
+    {
+        if (state == null || nextState == null) {
+            return 0.0;
+        }
+        TeamView myBefore = state.getTeamView(me);
+        TeamView oppBefore = state.getTeamView(1 - me);
+        TeamView myAfter = nextState.getTeamView(me);
+        TeamView oppAfter = nextState.getTeamView(1 - me);
+
+        double hp = HP_WEIGHT * ((hpFrac(myAfter) - hpFrac(oppAfter)) - (hpFrac(myBefore) - hpFrac(oppBefore)));
+
+        int myKo = fainted(myAfter) - fainted(myBefore);
+        int oppKo = fainted(oppAfter) - fainted(oppBefore);
+        double ko = KO_REWARD * (oppKo - myKo);
+
+        double status = statusDelta(oppBefore, oppAfter) - statusDelta(myBefore, myAfter);
+
+        double terminal = 0.0;
+        if (nextState.isOver()) {
+            boolean iLost = alive(myAfter) == 0;
+            boolean oppLost = alive(oppAfter) == 0;
+            if (oppLost && !iLost) terminal = WIN_REWARD;
+            else if (iLost && !oppLost) terminal = -WIN_REWARD;
+            else if (iLost && oppLost) terminal = DRAW_REWARD; // mutual KO is not a win
         }
 
-        private int faintedCount(TeamView team) {
-            int cnt = 0;
-            for (int i = 0; i < team.size(); i++) {
-                if (team.getPokemonView(i).hasFainted()) cnt++;
+        double switchPenalty = (action instanceof SwitchMoveView) ? -SWITCH_PENALTY : 0.0;
+
+        double r = hp + ko + status + terminal + switchPenalty;
+        return Math.max(-2.0, Math.min(2.0, r));
+    }
+
+    /** How much worse off a team's statuses got (positive = more/worse ailments), compared slot by slot. */
+    private static double statusDelta(TeamView before, TeamView after)
+    {
+        double d = 0.0;
+        int n = Math.min(before.size(), after.size());
+        for (int i = 0; i < n; i++) {
+            PokemonView b = before.getPokemonView(i);
+            PokemonView a = after.getPokemonView(i);
+            if (b == null || a == null || a.hasFainted()) {
+                continue;
             }
-            return cnt;
+            NonVolatileStatus sb = b.getNonVolatileStatus();
+            NonVolatileStatus sa = a.getNonVolatileStatus();
+            if (sb == sa) {
+                continue;
+            }
+            if (sb == NonVolatileStatus.NONE) {
+                d += severity(sa);
+            } else if (sa == NonVolatileStatus.NONE) {
+                d -= CURE_REWARD;
+            } else {
+                d += severity(sa) - severity(sb);
+            }
         }
-        
+        return d;
+    }
+
+    private static double severity(NonVolatileStatus s)
+    {
+        if (s == null) return 0.0;
+        switch (s) {
+            case SLEEP:
+            case FREEZE:
+                return 0.10;
+            case TOXIC:
+                return 0.08;
+            case PARALYSIS:
+                return 0.06;
+            case BURN:
+            case POISON:
+                return 0.04;
+            default:
+                return 0.0;
+        }
+    }
+
+    private static double hpFrac(TeamView team)
+    {
+        double cur = 0.0, max = 0.0;
+        for (int i = 0; i < team.size(); i++) {
+            PokemonView p = team.getPokemonView(i);
+            if (p == null) continue;
+            cur += Math.max(0, p.getCurrentStat(Stat.HP));
+            max += p.getInitialStat(Stat.HP);
+        }
+        return max <= 0 ? 0.0 : cur / max;
+    }
+
+    private static int fainted(TeamView team)
+    {
+        int n = 0;
+        for (int i = 0; i < team.size(); i++) {
+            PokemonView p = team.getPokemonView(i);
+            if (p != null && p.hasFainted()) n++;
+        }
+        return n;
+    }
+
+    private static int alive(TeamView team)
+    {
+        int n = 0;
+        for (int i = 0; i < team.size(); i++) {
+            PokemonView p = team.getPokemonView(i);
+            if (p != null && !p.hasFainted()) n++;
+        }
+        return n;
+    }
 }

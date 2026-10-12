@@ -1,0 +1,5 @@
+src/pas/pokemon/train/Evaluate.java
+src/pas/pokemon/train/Battles.java
+src/pas/pokemon/train/FastMLP.java
+src/pas/pokemon/train/DQNTrainer.java
+src/pas/pokemon/train/SelfTest.java

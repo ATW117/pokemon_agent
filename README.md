@@ -1,7 +1,73 @@
-## Project Overview
+# Pokémon Battle Agent: Double DQN with self-play
+
+A reinforcement-learning agent that plays Gen-1 Pokémon battles. It started as a Boston University AI course assignment (Dec 2025, v1 below) and was later reworked (Oct 2026, v2). The rework fixed the training pipeline, several bugs in the course's battle framework, and the feature set.
+
+## Results
+
+All numbers are win rates on 3,000 fresh games per opponent with random teams. Team sizes are 1-6 Pokémon per side unless noted.
+
+| Agent | vs RandomAgent | vs AggroAgent | vs Drac5290Agent (teams of 1-3) |
+|---|---|---|---|
+| v1 (course, `params.model`) | 49.6% | 44.2% | 40.0% |
+| **v2 (`params_v4.model`)** | **78.9%** | **73.3%** | **62.3%** |
+
+- In full 6v6 battles, v2 wins **89.7%** vs Random and **82.7%** vs Aggro.
+- 1v1 battles are mostly decided by which two Pokémon get drawn: 64% vs Random.
+- For reference, AggroAgent itself beats RandomAgent only 56% of the time.
+
+## What changed in v2
+
+**Training pipeline (`src/pas/pokemon/train/`)**
+- `DQNTrainer` replaces the course's `ParallelTrain`:
+  - Double DQN with 3-step returns, a Huber loss and a hard-synced target network.
+  - Self-play against a pool of frozen past snapshots, mixed with Random, Aggro and the transition-model agent Drac5290.
+  - Random team sizes from 1 to 6, and the learner plays both sides.
+- The course trainer stored each action next to the *following* turn's transition, an off-by-one error. `DQNTrainer` records `(state the action was chosen in, action, resulting state)`.
+- `FastMLP` is a plain-array network (458 → 512 → 256 → 1) with Adam. It is weight-compatible with the framework's `Sequential`/`Dense`, so saved `.model` files load in the original agent code.
+- Evaluation plays every team pairing twice with sides swapped (paired evaluation), which cancels most of the team-draw luck.
+
+**Agent (`PolicyAgent`, `CustomSensorArray`, `CustomRewardFunction`)**
+- Training and evaluation now choose from the same actions. v1 allowed only attacks at evaluation time.
+- Switch actions now describe the Pokémon being switched in. In v1 every switch looked like the same 1-power Normal move.
+- New features:
+  - Move identity (172 moves). v1 could not tell Swords Dance from Leer.
+  - Type effectiveness.
+  - An expected-damage estimate that mirrors the engine's damage formula, including STAB, crits, screens, accuracy/evasion stages, multi-hit and fixed-damage moves, and Fly/Dig.
+  - Everything is encoded from the agent's own side, which makes self-play possible.
+- Rewards are rescaled to roughly ±1 per step and computed per Pokémon slot. In v1, switching out a statused Pokémon counted as "curing" it.
+- He weight initialization. The framework's default draws weights with standard deviation 1, which saturates a 300-input network.
+- A guard against endless switch loops, applied the same way in acting and in training targets.
+
+**Course framework bugs found and fixed (local patch jar, not published)**
+- `CoreRegistry.readCSV` never closes its resource stream, and the framework rebuilds the registry for every battle and every Metronome use. Training leaked roughly 700 MB of native memory per cycle (45 GB RSS observed). `Battles.java` works around this in the trainer.
+- In the transition model (`getPotentialEffects`), multi-hit moves expanded exponentially and Metronome → Mirror Move → Metronome recursed without bound. Drac5290Agent runs out of memory or never finishes because of this. The patch merges identical outcomes and adds a recursion guard.
+- These fixes live in `patches/pokePA-patches.jar`, which is placed before `lib/*` on the classpath. Both are built from decompiled course code, so they are not included in this repo.
+
+## Running
+
+You need the course framework jars in `lib/` (not included). Run everything from the repo root.
+
+```bash
+./train_dqn.sh myrun                 # trains; logs and checkpoints go to runs/myrun/
+./watchdog.sh myrun 18 &             # optional: stop the run if RSS exceeds 18 GB
+
+# evaluate a model: <model> <games> <threads> <seed> <minTeam> <maxTeam> <opponents...>
+java -cp "build:lib/*" src.pas.pokemon.train.Evaluate params_v4.model 3000 16 7 1 6 \
+  edu.bu.pas.pokemon.agents.RandomAgent edu.bu.pas.pokemon.agents.AggroAgent
+```
+
+- `params_v4.model` holds the current weights.
+- `params.model` holds the original v1 weights, kept for reference. They need the v1 code (git tag `v1-course`).
+- The v2 run: 8 hours on 16 CPU threads of an NVIDIA DGX Spark, about 1M games.
+
+---
+
+## v1: original course version (Dec 2025)
+
+### Project Overview
 This repository contains a reinforcement learning agent trained to play Pokemon battles using Deep Q-Learning. The agent was trained on Boston University's Shared Computing Cluster (SCC) using a Double DQN architecture with epsilon-greedy exploration. The implementation includes custom reward shaping, extensive feature engineering, and strategic Pokemon switching logic.
 
-## Dependencies
+### Dependencies
 
 This project was built for a BU course and requires the following dependencies (not included):
 - `pokePA-1.1.0.jar` - Custom Pokemon game framework (provided by course)
@@ -12,12 +78,12 @@ This project was built for a BU course and requires the following dependencies (
 
 **Note**: This repository contains only my implementation of the Reinforcement Learning agent, sensory array, and reward function. it also includes the trained model params, and the script I used to train my model. To run this code, you would need the course framework.
 
-## Architecture and Implementation
+### Architecture and Implementation
 - Model Type: Double DQN (Deep Q-Network with target network)
 - Input Features: 291-dimensional feature vector
 - Network structure: 291-feature input layer, 2 hidden layers with 128 neurons and ReLU activations each, and 1-neuron output layer (Q-value for state-action pair)
 
-## Feature Engineering (CustomSensorArray.java)
+### Feature Engineering (CustomSensorArray.java)
 The sensor array generates a 291-dimensional feature vector encoding:
 Active Pokemon Features (Both Teams):
 - HP ratios (current/max)
@@ -57,7 +123,7 @@ Move Features:
 - Opponent's last move priority
 
 
-## Reward Function Design (CustomRewardFunction.java)
+### Reward Function Design (CustomRewardFunction.java)
 The reward function uses a STATE_ACTION_STATE paradigm with carefully tuned components:
 HP-Based Rewards:
 
@@ -89,7 +155,7 @@ Encourages commitment and discourages excessive switching
 
 Bounds: All rewards are clamped to [-50.0, 50.0]
 
-## Pokemon Selection Strategy (PolicyAgent.java)
+### Pokemon Selection Strategy (PolicyAgent.java)
 When forced to switch (e.g., after a faint), the agent uses a heuristic-based selection:
 Scoring Components:
 
@@ -132,7 +198,7 @@ Win rate logged every 100 games
 Epsilon value logged every 100,000 training steps
 Consecutive switch tracking to prevent degenerate policies
 
-## Key Design Decisions
+### Key Design Decisions
 - Extensive Feature Engineering: 291 features capture nearly all relevant battle state information, including team composition, stat stages, status conditions, and move properties.
 - Shaped Rewards: Rather than sparse +1/-1 win/loss rewards, the reward function provides dense feedback on HP trades, KOs, and status conditions to accelerate learning.
 - Double DQN: Prevents Q-value overestimation that plagues vanilla DQN, leading to more stable training.
@@ -140,7 +206,7 @@ Consecutive switch tracking to prevent degenerate policies
 - Type Effectiveness Integration: Offensive/defensive estimations explicitly compute type matchup multipliers, incorporating core Pokemon battle mechanics.
 - Status Prioritization: Higher rewards for SLEEP/FREEZE (most debilitating) and TOXIC (escalating damage) reflect competitive Pokemon strategy.
 
-## Usage
+### Usage
 This code is designed to work with the BU course framework and is provided for reference purposes.
 
 Training the Agent
@@ -169,7 +235,7 @@ Training was performed on BU's Shared Computing Cluster with a remote desktop se
 - Compiled and ran the training script
 - Monitored training logs for convergence and win rate improvements
 
-## Future Improvements
+### Future Improvements
 Potential enhancements could include:
 - Prioritized experience replay for more efficient learning
 - Learned switching policy (instead of heuristic)
@@ -177,7 +243,7 @@ Potential enhancements could include:
 - Multi-step returns for improved credit assignment
 - Ensemble models for robustness
 
-## Acknowledgments
+### Acknowledgments
 This project was completed as part of a BU AI course. The Pokemon battle framework was provided by the course instructors.
 
 
